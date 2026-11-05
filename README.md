@@ -1,107 +1,100 @@
 # VitaLoom Data Producer
 
-A standalone Go-based engine for generating realistic health events and controlled workloads for VitaLoom.
+A standalone Go CLI that generates synthetic Heart Rate and Steps events and publishes them to VitaLoom Backend. It is intended for local demos, integration checks and controlled development workloads — not as a source of real wearable data or medical advice.
 
-## Why this repository exists
+## Current capabilities
 
-This project has two related goals:
+The initial implementation has been migrated from the end-to-end demo:
 
-1. **Behavior-based data simulation** — produce plausible heart-rate and step events for demos and for validating the backend's ingestion, ETL, and daily/weekly statistics.
-2. **Controlled load generation** — create repeatable workloads to measure backend throughput, latency, error rate, and resource usage.
+- Generates batches of synthetic Heart Rate observations and Step increments.
+- Sends them to the matching Backend batch endpoints over HTTP.
+- Uses stable event IDs and preserves the same request body during retries.
+- Supports a configurable batch size, interval, request timeout, bounded retries and optional run duration.
+- Logs per-batch results and a run summary.
+- Includes unit tests for configuration, event generation, HTTP behavior and producer lifecycle.
 
-The producer is a tool for development and testing, not a source of medical advice or real wearable data.
+The following are future work, not implemented capabilities: profile-driven behavioral scenarios, UI-controlled simulation, load-test profiles, and richer observability.
 
-## Initial architecture
+## Architecture
 
 ```text
-VitaLoom Frontend
-    | user actions / simulation controls
-    v
-VitaLoom Backend (Spring Boot, initially one instance)
-    | HTTP ingestion API
-    ^ 
-    | batched health events
-VitaLoom Data Producer (Go, separate process)
+VitaLoom Data Producer (Go)
+        |
+        | HTTP batch requests
+        v
+VitaLoom Backend (Spring Boot)
+        |
+        v
+     MongoDB
 ```
 
-- Spring Boot remains the system's core backend: authentication, profile, manual sleep/water input, event ingestion, persistence, ETL, and statistics APIs.
-- The producer sends events to the backend over HTTP (batching where appropriate). It must not write directly to the backend database.
-- Sleep and water intake are manual-entry metrics in the current MVP scope. The producer initially focuses on heart rate and steps.
-- Keep the first version small: one producer process and one Spring Boot instance. Do not introduce Kafka, distributed workers, or a separate Go processing service without a measured need.
+The Producer never connects to MongoDB. Backend validation, persistence, deduplication and aggregation remain authoritative.
 
-## Workload modes
+## API contract
 
-### 1. Simulation mode
+The canonical contract lives in [vitaloom-backend/docs/api/api-contract.md](https://github.com/vitaloom/vitaloom-backend/blob/main/docs/api/api-contract.md).
 
-Simulate wearable-like behavior rather than generating unrelated random values.
+| Method | Endpoint | Event type |
+|---|---|---|
+| POST | `/api/heart-rate/batch` | Heart Rate observations |
+| POST | `/api/steps/batch` | Step increments |
 
-- Use a profile and scenario to plan behavior over simulation time.
-- Generate correlated signals: activity can increase steps and raise heart rate, followed by recovery.
-- Keep simulation time distinct from wall-clock emission time.
-- Support reproducible runs (for example, a configurable seed) to make tests and demos repeatable.
-- Make missing observations distinct from a measured value of zero.
+Do not change payload fields, response handling, event identity or timestamp semantics independently of the Backend contract.
 
-### 2. Load-test mode
+## Prerequisites
 
-Generate a controlled workload to evaluate the backend independently of the demo UI.
+- Go 1.23 or newer.
+- A running VitaLoom Backend with the corresponding ingestion endpoints implemented.
+- Network access from the Producer process to the Backend base URL.
 
-The load profile should eventually support:
+## Run locally
 
-- target event rate and/or virtual-user count;
-- duration and warm-up/ramp-up;
-- constant, ramp-up, spike, and soak patterns;
-- batch size, request timeout, and bounded retries;
-- safe concurrency limits and an explicit stop mechanism.
+Run from the repository root:
 
-Virtual users, events per second, and HTTP requests per second are different measurements and must be reported separately. Load tests should run only against an explicitly configured, authorized test environment.
-
-## Initial event contract (proposal)
-
-Agree on the contract with `vitaloom-backend` before implementation. A starting envelope could be:
-
-```json
-{
-  "eventId": "stable-unique-event-id",
-  "runId": "producer-run-id",
-  "type": "HEART_RATE_RECORDED",
-  "occurredAt": "2026-01-01T07:30:00Z",
-  "emittedAt": "2026-01-01T07:30:02Z",
-  "payload": {
-    "value": 112,
-    "unit": "bpm"
-  }
-}
+```bash
+go run . --api-base-url http://localhost:8080 --batch-size 5 --interval 2s --duration 90s
 ```
 
-This is illustrative, not a finalized API contract. Define user/device identity, step-event shape, units, timestamp semantics, validation, batching, duplicate handling, authentication, and error behavior jointly with the backend. Use `occurredAt` for simulation/event time and `emittedAt` for wall-clock send time.
+Omit `--duration` or set it to `0s` to run until Ctrl+C.
 
-## Proposed implementation roadmap
+The current defaults are:
 
-1. **Agree on contracts** — event envelope, batch ingestion request/response, simulation scenario, load profile, and run lifecycle.
-2. **Build a minimal Go CLI** — configuration, seeded event generation, heart-rate/step simulation, HTTP batch publisher, graceful shutdown.
-3. **Validate the end-to-end path** — send events to the single Spring Boot instance; verify persistence, deduplication behavior, and daily/weekly aggregates.
-4. **Add controlled load tests** — ramp load gradually, collect producer-side throughput/errors/latency, and compare with backend/database metrics.
-5. **Add observability** — structured logs and per-run metrics first; consider OpenTelemetry and dashboards when useful.
-6. **Evaluate scaling only from evidence** — if processing competes with API traffic or near-real-time stream processing becomes a real requirement, consider a separate Go processing service and/or a broker. Do not build these pre-emptively.
+| Option | Default | Description |
+|---|---:|---|
+| `--api-base-url` | `http://localhost` | Backend/API base URL |
+| `--batch-size` | `5` | Events per metric batch (1–500) |
+| `--interval` | `5s` | Delay between batch cycles |
+| `--duration` | `0s` | Unlimited until stopped |
+| `--timeout` | `5s` | HTTP attempt timeout |
+| `--max-retries` | `3` | Retries after the initial attempt (0–10) |
+| `--retry-delay` | `500ms` | Delay between retries |
 
-## Success criteria for the first useful version
+Every option can also be configured with its corresponding `VITALOOM_*` environment variable, for example `VITALOOM_API_BASE_URL` and `VITALOOM_BATCH_SIZE`.
 
-- Generates plausible, reproducible heart-rate and step events.
-- Sends events to the backend using a documented, validated contract.
-- Can run and stop a simulation cleanly.
-- Can run a bounded load profile and report events generated/sent, request rate, failures, and latency.
-- Supports end-to-end verification that generated events reach backend persistence and statistics.
+## Development checks
 
-## Non-goals for the initial MVP
+```bash
+gofmt -w *.go
+go test ./...
+go vet ./...
+go build ./...
+```
 
-- Connecting to real Apple Health / HealthKit APIs or collecting real wearable data.
-- Owning business rules, user profiles, the database, ETL, or statistics.
-- Implementing a distributed load-testing platform, Kafka, Kubernetes, or a separate real-time processing service before measurements justify them.
+## Repository layout
 
-## Design principles
+```text
+.
+├── main.go
+├── config.go
+├── events.go
+├── client.go
+├── producer.go
+├── *_test.go
+├── go.mod
+├── AGENTS.md
+└── README.md
+```
 
-- **Simple first, extensible by contract.**
-- **Realistic simulation and performance load are separate workloads.**
-- **Measure before optimizing or splitting services.**
-- **Repeatability and data correctness matter as much as raw throughput.**
-- **Protect the target system:** bound load, make the target environment explicit, and provide a stop path.
+## Scope boundaries
+
+This repository implements a development simulator. It does not read Apple Health/HealthKit or connect to a physical wearable. Sleep and Water remain manual-entry metrics owned by the Mobile app and Backend. Keep the first deployment simple: one Producer process and one Spring Boot Backend instance.
