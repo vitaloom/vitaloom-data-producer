@@ -1,0 +1,8 @@
+.env
+.env.*
+!.env.example
+coverage.out
+*.test
+*.out
+/tmp/
+.DS_Store
