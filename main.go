@@ -18,16 +18,21 @@ func main() {
 	}
 }
 func run(args []string) error {
+	dotenv, err := LoadDotEnv(".env")
+	if err != nil {
+		return err
+	}
+	getenv := environmentLookup(dotenv)
 	if len(args) > 0 && args[0] == "provision" {
 		logger := log.New(os.Stdout, "[vitaloom-producer] ", log.LstdFlags|log.LUTC)
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
-		return runProvision(ctx, args[1:], os.Getenv, logger)
+		return runProvision(ctx, args[1:], getenv, logger)
 	}
 	if len(args) > 0 && args[0] == "heart-rate" {
 		logger := log.New(os.Stdout, "[vitaloom-producer] ", log.LstdFlags|log.LUTC)
 		if hasVirtualUsersFlag(args[1:]) {
-			options, cfg, password, err := parseHeartRateMultiUserCommand(args[1:], os.Getenv)
+			options, cfg, password, err := parseHeartRateMultiUserCommand(args[1:], getenv)
 			if err != nil {
 				if errors.Is(err, flag.ErrHelp) {
 					return nil
@@ -38,7 +43,7 @@ func run(args []string) error {
 			defer stop()
 			return runHeartRateMultiUser(ctx, cfg, password, options, logger)
 		}
-		cfg, password, accountIndex, measurementInterval, batchInterval, duration, scheduled, err := parseHeartRateCommand(args[1:], os.Getenv)
+		cfg, password, accountIndex, measurementInterval, batchInterval, duration, scheduled, err := parseHeartRateCommand(args[1:], getenv)
 		if err != nil {
 			if errors.Is(err, flag.ErrHelp) {
 				return nil
@@ -52,7 +57,7 @@ func run(args []string) error {
 		}
 		return runHeartRateOnce(ctx, cfg, password, accountIndex, logger)
 	}
-	cfg, err := ParseConfig(args, os.Getenv)
+	cfg, err := ParseConfig(args, getenv)
 	if err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
