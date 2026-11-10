@@ -53,16 +53,15 @@ Do not change payload fields, response handling, event identity or timestamp sem
 
 ## Run locally
 
-Run from the repository root. Set `VITALOOM_API_BASE_URL` to your authorized Nginx listener and replace the example value with the actual host and port. For local Nginx on its default HTTP port, use `http://localhost`; do not point the Producer directly at Spring Boot. This initial ingestion command preserves its legacy behavior and does not yet log in or send Bearer tokens (authenticated Heart Rate integration is Phase 2).
+From the repository root, use the PowerShell setup under [Provision test accounts](#provision-test-accounts) with your test Nginx URL. Use the command below inside `try`.
 
 ```powershell
-$env:VITALOOM_API_BASE_URL = 'http://localhost:<nginx-port>'
-go run . --batch-size 5 --interval 2s --duration 90s
+go run . heart-rate --account 1
 ```
 
-Omit `--duration` or set it to `0s` to run until Ctrl+C.
+This command logs in as `loadtest-0001@vitaloom.test`, submits one Heart Rate batch, and reads that account's summary through the same Nginx URL. Provision the account first if needed.
 
-The current defaults are:
+The following flags belong to the legacy simulator command:
 
 | Option | Default | Description |
 |---|---:|---|

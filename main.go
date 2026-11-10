@@ -24,6 +24,19 @@ func run(args []string) error {
 		defer stop()
 		return runProvision(ctx, args[1:], os.Getenv, logger)
 	}
+	if len(args) > 0 && args[0] == "heart-rate" {
+		logger := log.New(os.Stdout, "[vitaloom-producer] ", log.LstdFlags|log.LUTC)
+		cfg, password, accountIndex, err := parseHeartRateCommand(args[1:], os.Getenv)
+		if err != nil {
+			if errors.Is(err, flag.ErrHelp) {
+				return nil
+			}
+			return err
+		}
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		return runHeartRateOnce(ctx, cfg, password, accountIndex, logger)
+	}
 	cfg, err := ParseConfig(args, os.Getenv)
 	if err != nil {
 		if errors.Is(err, flag.ErrHelp) {
