@@ -61,6 +61,14 @@ go run . heart-rate --account 1
 
 This command logs in as `loadtest-0001@vitaloom.test`, submits one Heart Rate batch, and reads that account's summary through the same Nginx URL. Provision the account first if needed.
 
+To schedule one measurement per device independently from batch flushes, use positive intervals and an optional duration. The duration starts after login; `0s` runs until Ctrl+C. Scheduled Heart Rate runs keep at most 1,000 outstanding events, send batches of up to 500, and drain pending events for up to five seconds on shutdown.
+
+```powershell
+go run . heart-rate --account 1 --measurement-interval 1s --batch-interval 5s --duration 30s
+```
+
+Scheduled mode defaults to a `1s` measurement interval and `5s` batch interval. Supplying none of the scheduling flags keeps the one-shot command above.
+
 The following flags belong to the legacy simulator command:
 
 | Option | Default | Description |
