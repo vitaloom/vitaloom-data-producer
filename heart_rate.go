@@ -15,6 +15,14 @@ import (
 	"time"
 )
 
+const (
+	heartRateMeasurementInterval = time.Second
+	heartRateBatchInterval       = 5 * time.Second
+	heartRateQueueLimit          = 1000
+	heartRateShutdownBudget      = 5 * time.Second
+	heartRateRefreshBefore       = 30 * time.Second
+)
+
 const heartRateSampleCount = 3
 
 type authenticatedHeartRateBatch struct {
@@ -235,31 +243,52 @@ func waitContext(ctx context.Context, delay time.Duration) error {
 	}
 }
 
-func parseHeartRateCommand(args []string, getenv func(string) string) (Config, string, int, error) {
+func parseHeartRateCommand(args []string, getenv func(string) string) (Config, string, int, time.Duration, time.Duration, time.Duration, bool, error) {
 	fs := flag.NewFlagSet("heart-rate", flag.ContinueOnError)
 	fs.SetOutput(os.Stdout)
 	fs.Usage = func() {
-		fmt.Fprintln(fs.Output(), "Usage: producer heart-rate --account INDEX")
-		fmt.Fprintln(fs.Output(), "Logs into the selected deterministic test account, submits one Heart Rate batch, then reads its summary.")
+		fmt.Fprintln(fs.Output(), "Usage: producer heart-rate --account INDEX [--measurement-interval DURATION --batch-interval DURATION [--duration DURATION]]")
+		fmt.Fprintln(fs.Output(), "Without scheduling flags, submits one Heart Rate batch and reads the account summary.")
 	}
 	accountIndex := fs.Int("account", 0, "deterministic test account index (1-1000)")
+	measurementText := fs.String("measurement-interval", heartRateMeasurementInterval.String(), "time between Heart Rate measurements")
+	batchText := fs.String("batch-interval", heartRateBatchInterval.String(), "time between Heart Rate batch flushes")
+	durationText := fs.String("duration", "0s", "scheduled run duration; 0s means run until Ctrl+C")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
-			return Config{}, "", 0, flag.ErrHelp
+			return Config{}, "", 0, 0, 0, 0, false, flag.ErrHelp
 		}
-		return Config{}, "", 0, errors.New("invalid heart-rate command arguments")
+		return Config{}, "", 0, 0, 0, 0, false, errors.New("invalid heart-rate command arguments")
 	}
 	if fs.NArg() != 0 {
-		return Config{}, "", 0, errors.New("heart-rate does not accept positional arguments")
+		return Config{}, "", 0, 0, 0, 0, false, errors.New("heart-rate does not accept positional arguments")
 	}
+	scheduled := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "measurement-interval" || f.Name == "batch-interval" || f.Name == "duration" {
+			scheduled = true
+		}
+	})
 	if err := validateAccountRange(*accountIndex, *accountIndex); err != nil {
-		return Config{}, "", 0, errors.New("--account must be between 1 and 1000")
+		return Config{}, "", 0, 0, 0, 0, false, errors.New("--account must be between 1 and 1000")
+	}
+	measurementInterval, err := time.ParseDuration(*measurementText)
+	if err != nil || measurementInterval <= 0 {
+		return Config{}, "", 0, 0, 0, 0, false, errors.New("--measurement-interval must be a positive duration")
+	}
+	batchInterval, err := time.ParseDuration(*batchText)
+	if err != nil || batchInterval <= 0 {
+		return Config{}, "", 0, 0, 0, 0, false, errors.New("--batch-interval must be a positive duration")
+	}
+	duration, err := time.ParseDuration(*durationText)
+	if err != nil || duration < 0 {
+		return Config{}, "", 0, 0, 0, 0, false, errors.New("--duration must be zero or a positive duration")
 	}
 	cfg, password, err := authConfigFromEnv(getenv)
 	if err != nil {
-		return Config{}, "", 0, err
+		return Config{}, "", 0, 0, 0, 0, false, err
 	}
-	return cfg, password, *accountIndex, nil
+	return cfg, password, *accountIndex, measurementInterval, batchInterval, duration, scheduled, nil
 }
 
 func runHeartRateOnce(ctx context.Context, cfg Config, password string, accountIndex int, logger *log.Logger) error {
