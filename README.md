@@ -67,14 +67,22 @@ From the repository root, copy `.env.example` to `.env`, set `VITALOOM_TEST_PASS
 Copy-Item .env.example .env
 ```
 
-Provision or verify one test account, then run the one-shot Heart Rate command:
+Provision or verify one test account, then run the authenticated combined simulator:
 
 ```powershell
 go run . provision --from 1 --to 1
-go run . heart-rate --account 1
+go run . --account 1 --duration 30s
 ```
 
-The Heart Rate command logs in as `loadtest-0001@vitaloom.test`, submits one Heart Rate batch, and reads that account's summary through the configured Nginx URL. Provision the account first if needed.
+With no subcommand, the Producer logs in as `loadtest-0001@vitaloom.test` and schedules authenticated Heart Rate and Steps batches through the configured Nginx URL. Both use the same account. Provision the account first if needed. Heart Rate uses its scheduled ingestion path in combined mode and does not request the legacy Heart Rate summary endpoint.
+
+Run Steps by itself with `step`. Steps measurements stay one second apart; `--batch-interval` controls only when queued Steps events are flushed. Empty flushes are skipped.
+
+```powershell
+go run . step --account 1 --batch-interval 5s --duration 30s
+```
+
+The explicit Heart Rate command keeps its existing behavior: without scheduling flags it submits one Heart Rate batch and reads the summary; with scheduling flags it runs the authenticated scheduler.
 
 To schedule one measurement per device independently from batch flushes, use positive intervals and an optional duration. The duration starts after login; `0s` runs until Ctrl+C. Scheduled Heart Rate runs keep at most 1,000 outstanding events, send batches of up to 500, and drain pending events for up to five seconds on shutdown.
 
@@ -91,19 +99,19 @@ go run . heart-rate --virtual-users 1 --ramp-up 0s --duration 20s --measurement-
 go run . heart-rate --virtual-users 10 --ramp-up 5s --duration 20s --measurement-interval 1s --batch-interval 5s
 ```
 
-The following flags belong to the legacy simulator command:
+The combined mode keeps these compatible run flags:
 
 | Option | Default | Description |
 |---|---:|---|
-| `--api-base-url` | `http://localhost` | Backend/API base URL |
-| `--batch-size` | `5` | Events per metric batch (1–500) |
-| `--interval` | `5s` | Delay between batch cycles |
-| `--duration` | `0s` | Unlimited until stopped |
+| `--api-base-url` | configured URL required | Authorized test Nginx base URL |
+| `--batch-size` | `5` | Maximum events per metric batch (1–500) |
+| `--interval` | `5s` | Flush interval for both metric streams; Steps measurements remain one second apart |
+| `--duration` | `0s` | Run duration; `0s` continues until stopped |
 | `--timeout` | `5s` | HTTP attempt timeout |
 | `--max-retries` | `3` | Retries after the initial attempt (0–10) |
 | `--retry-delay` | `500ms` | Delay between retries |
 
-Every option can also be configured with its corresponding `VITALOOM_*` environment variable, for example `VITALOOM_API_BASE_URL` and `VITALOOM_BATCH_SIZE`.
+These flags can also be configured with their corresponding `VITALOOM_*` environment variables, including `VITALOOM_API_BASE_URL`, `VITALOOM_BATCH_SIZE`, `VITALOOM_INTERVAL`, and `VITALOOM_DURATION`. Combined mode requires a configured Nginx URL and test password. `step` accepts `--batch-size`, `--batch-interval`, and `--duration`; its batch interval also defaults from `VITALOOM_INTERVAL` when `VITALOOM_BATCH_INTERVAL` is not set.
 
 ## Provision test accounts
 

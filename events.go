@@ -35,6 +35,42 @@ type EventGenerator struct {
 	stepsSeq  uint64
 }
 
+type StepEventGenerator struct {
+	runID string
+	rng   *mathrand.Rand
+	seq   uint64
+}
+
+func NewStepEventGenerator(runID string, _ time.Time, rng *mathrand.Rand) *StepEventGenerator {
+	if rng == nil {
+		rng = mathrand.New(mathrand.NewSource(time.Now().UnixNano()))
+	}
+	return &StepEventGenerator{runID: runID, rng: rng}
+}
+
+func (g *StepEventGenerator) Next(at time.Time) (StepEvent, bool) {
+	delta := 0
+	if g.seq == 0 {
+		// The first observation proves the smoke path can produce data promptly.
+		delta = 1 + g.rng.Intn(5)
+	} else {
+		delta = g.rng.Intn(6)
+	}
+	return makeStepEvent(g.runID, &g.seq, delta, at)
+}
+
+func makeStepEvent(runID string, sequence *uint64, delta int, at time.Time) (StepEvent, bool) {
+	if delta < 1 || delta > 5 {
+		return StepEvent{}, false
+	}
+	*sequence++
+	return StepEvent{
+		EventID:    fmt.Sprintf("steps-%s-%06d", runID, *sequence),
+		OccurredAt: at.UTC().Truncate(time.Millisecond),
+		StepsDelta: delta,
+	}, true
+}
+
 func NewEventGenerator(runID string, startedAt time.Time, rng *mathrand.Rand) *EventGenerator {
 	if rng == nil {
 		rng = mathrand.New(mathrand.NewSource(time.Now().UnixNano()))

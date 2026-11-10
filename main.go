@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 )
 
 func main() {
@@ -23,14 +22,13 @@ func run(args []string) error {
 		return err
 	}
 	getenv := environmentLookup(dotenv)
+	logger := log.New(os.Stdout, "[vitaloom-producer] ", log.LstdFlags|log.LUTC)
 	if len(args) > 0 && args[0] == "provision" {
-		logger := log.New(os.Stdout, "[vitaloom-producer] ", log.LstdFlags|log.LUTC)
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
 		return runProvision(ctx, args[1:], getenv, logger)
 	}
 	if len(args) > 0 && args[0] == "heart-rate" {
-		logger := log.New(os.Stdout, "[vitaloom-producer] ", log.LstdFlags|log.LUTC)
 		if hasVirtualUsersFlag(args[1:]) {
 			options, cfg, password, err := parseHeartRateMultiUserCommand(args[1:], getenv)
 			if err != nil {
@@ -57,23 +55,26 @@ func run(args []string) error {
 		}
 		return runHeartRateOnce(ctx, cfg, password, accountIndex, logger)
 	}
-	cfg, err := ParseConfig(args, getenv)
+	if len(args) > 0 && args[0] == "step" {
+		options, cfg, password, err := parseStepsCommand(args[1:], getenv)
+		if err != nil {
+			if errors.Is(err, flag.ErrHelp) {
+				return nil
+			}
+			return err
+		}
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		return runStepsScheduled(ctx, cfg, password, options, logger)
+	}
+	options, cfg, password, err := parseCombinedCommand(args, getenv)
 	if err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
 		}
 		return err
 	}
-	logger := log.New(os.Stdout, "[vitaloom-producer] ", log.LstdFlags|log.LUTC)
-	runID, err := NewRunID(time.Now())
-	if err != nil {
-		return err
-	}
-	generator := NewEventGenerator(runID, time.Now(), nil)
-	client := NewAPIClient(cfg, logger)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	stats, runErr := runProducer(ctx, cfg, client, logger, generator)
-	logSummary(logger, stats, runErr)
-	return runErr
+	return runAuthenticatedCombined(ctx, cfg, password, options, logger)
 }

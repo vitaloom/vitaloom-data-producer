@@ -29,6 +29,13 @@ type heartRateSendResult struct {
 type heartRateSendFunc func(context.Context, authenticatedHeartRateBatch) (authenticatedHeartRateResponse, int, error)
 
 func runHeartRateScheduled(ctx context.Context, cfg Config, password string, accountIndex int, measurementInterval, batchInterval, duration time.Duration, logger *log.Logger) error {
+	return runHeartRateScheduledWithBatchSize(ctx, cfg, password, accountIndex, measurementInterval, batchInterval, duration, maxBatchSize, logger)
+}
+
+func runHeartRateScheduledWithBatchSize(ctx context.Context, cfg Config, password string, accountIndex int, measurementInterval, batchInterval, duration time.Duration, batchSize int, logger *log.Logger) error {
+	if batchSize < 1 || batchSize > maxBatchSize {
+		return fmt.Errorf("Heart Rate batch size must be between 1 and %d", maxBatchSize)
+	}
 	account := deterministicAccount(accountIndex)
 	auth := NewAuthClient(cfg, password, logger)
 	session, err := auth.Login(ctx, account.Email)
@@ -58,12 +65,12 @@ func runHeartRateScheduled(ctx context.Context, cfg Config, password string, acc
 	if duration > 0 {
 		timer := time.NewTimer(duration)
 		defer timer.Stop()
-		return runHeartRateScheduleWithStop(ctx, timer.C, measureTicks, batchTicks, runID, accountIndex, generator, send, logger, func() {
+		return runHeartRateScheduleTimedLimit(ctx, timer.C, measureTicks, batchTicks, 0, 0, runID, accountIndex, generator, send, logger, batchSize, func() {
 			measureTicker.Stop()
 			batchTicker.Stop()
 		})
 	}
-	return runHeartRateScheduleWithStop(ctx, nil, measureTicks, batchTicks, runID, accountIndex, generator, send, logger, func() {
+	return runHeartRateScheduleTimedLimit(ctx, nil, measureTicks, batchTicks, 0, 0, runID, accountIndex, generator, send, logger, batchSize, func() {
 		measureTicker.Stop()
 		batchTicker.Stop()
 	})
@@ -78,6 +85,10 @@ func runHeartRateScheduleWithStop(ctx context.Context, duration <-chan time.Time
 }
 
 func runHeartRateScheduleTimed(ctx context.Context, duration <-chan time.Time, measurementTicks, batchTicks <-chan time.Time, batchInterval, firstBatchDelay time.Duration, runID string, accountIndex int, generator *EventGenerator, send heartRateSendFunc, logger *log.Logger, stopTickers func()) error {
+	return runHeartRateScheduleTimedLimit(ctx, duration, measurementTicks, batchTicks, batchInterval, firstBatchDelay, runID, accountIndex, generator, send, logger, maxBatchSize, stopTickers)
+}
+
+func runHeartRateScheduleTimedLimit(ctx context.Context, duration <-chan time.Time, measurementTicks, batchTicks <-chan time.Time, batchInterval, firstBatchDelay time.Duration, runID string, accountIndex int, generator *EventGenerator, send heartRateSendFunc, logger *log.Logger, batchSize int, stopTickers func()) error {
 	sendCtx, cancelSend := context.WithCancel(context.WithoutCancel(ctx))
 	defer cancelSend()
 	deviceID := fmt.Sprintf("device-loadtest-%04d", accountIndex)
@@ -167,7 +178,7 @@ func runHeartRateScheduleTimed(ctx context.Context, duration <-chan time.Time, m
 			if len(queue) == 0 {
 				return finish(stopErr)
 			}
-			n := min(maxBatchSize, len(queue))
+			n := min(batchSize, len(queue))
 			launch(queue[:n])
 			queue = queue[n:]
 		}
@@ -205,7 +216,7 @@ func runHeartRateScheduleTimed(ctx context.Context, duration <-chan time.Time, m
 			if !draining {
 				flushPending = true
 				if active == nil && len(queue) > 0 {
-					n := min(maxBatchSize, len(queue))
+					n := min(batchSize, len(queue))
 					launch(queue[:n])
 					queue = queue[n:]
 					flushPending = false
@@ -218,7 +229,7 @@ func runHeartRateScheduleTimed(ctx context.Context, duration <-chan time.Time, m
 			if !draining {
 				flushPending = true
 				if active == nil && len(queue) > 0 {
-					n := min(maxBatchSize, len(queue))
+					n := min(batchSize, len(queue))
 					launch(queue[:n])
 					queue = queue[n:]
 					flushPending = false
