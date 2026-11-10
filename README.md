@@ -16,6 +16,14 @@ The initial implementation has been migrated from the end-to-end demo:
 
 The following are future work, not implemented capabilities: profile-driven behavioral scenarios, UI-controlled simulation, load-test profiles, and richer observability.
 
+## Automated tests
+
+Run this from the repository root. The tests use a local fake API.
+
+```powershell
+go test ./...
+```
+
 ## Architecture
 
 ```text
@@ -92,21 +100,30 @@ Every option can also be configured with its corresponding `VITALOOM_*` environm
 
 ## Provision test accounts
 
-Provisioning creates or verifies the deterministic range `loadtest-0001@vitaloom.test` through `loadtest-1000@vitaloom.test`. It runs serially. Existing accounts are verified by login and are never reset. Start with one account, then choose a larger range when needed:
+Start Nginx and the Backend, then open PowerShell in the Producer repo.
 
-```powershell
-$env:VITALOOM_API_BASE_URL = 'http://localhost:<nginx-port>'
-$securePassword = Read-Host 'Test account password' -AsSecureString
-$env:VITALOOM_TEST_PASSWORD = (New-Object System.Net.NetworkCredential('', $securePassword)).Password
-try {
-    go run . provision --from 1 --to 1
-} finally {
-    Remove-Item Env:VITALOOM_TEST_PASSWORD -ErrorAction SilentlyContinue
-    Remove-Variable securePassword -ErrorAction SilentlyContinue
-}
-```
+1. **Set the test Nginx URL.** Change it below if your listener uses a different port or hostname.
 
-Use a test password of at least eight characters. `Read-Host -AsSecureString` does not echo the password while typing; the Producer reads it from the current PowerShell process environment. To provision the default full range, replace the command inside `try` with `go run . provision`; use `--from 1 --to 1000` to state the full range explicitly. The `finally` block clears the password after whichever command you choose. The provision command requires both `VITALOOM_API_BASE_URL` and `VITALOOM_TEST_PASSWORD`; the URL must be the authorized test Nginx listener and must not contain credentials, a query string or a fragment. Authentication retries default to at most two after the initial request. Retry-After seconds or HTTP dates are honored up to a 30-second wait cap; a longer requested wait aborts that retry. Authentication errors expose only a safe status/code and account index/email. There is no command that prints or exports tokens. The in-memory login warm-up and caller-owned refresh primitives are intended for the later ingestion integration.
+   ```powershell
+   $env:VITALOOM_API_BASE_URL = 'http://localhost'
+   ```
+
+2. **Try one account.** Enter a test password of at least 8 characters when prompted. If `loadtest-0001@vitaloom.test` already exists, enter its current password.
+
+   ```powershell
+   $securePassword = Read-Host 'Test account password' -AsSecureString
+   $env:VITALOOM_TEST_PASSWORD = (New-Object System.Net.NetworkCredential('', $securePassword)).Password
+   try {
+       go run . provision --from 1 --to 1
+   } finally {
+       Remove-Item Env:VITALOOM_TEST_PASSWORD -ErrorAction SilentlyContinue
+       Remove-Variable securePassword -ErrorAction SilentlyContinue
+   }
+   ```
+
+3. **Look for `count=1`.** Repeat step 2 with the same password to verify that the account can log in.
+
+To provision all 1,000 test accounts, replace the command inside `try` with `go run . provision`.
 
 ## Development checks
 
