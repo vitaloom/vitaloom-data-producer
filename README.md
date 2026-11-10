@@ -61,13 +61,20 @@ Do not change payload fields, response handling, event identity or timestamp sem
 
 ## Run locally
 
-From the repository root, use the PowerShell setup under [Provision test accounts](#provision-test-accounts) with your test Nginx URL. Use the command below inside `try`.
+From the repository root, copy `.env.example` to `.env`, set `VITALOOM_TEST_PASSWORD` to the password for your authorized test accounts, and adjust `VITALOOM_API_BASE_URL` if needed. The CLI reads `.env` from its current directory; process environment variables take precedence. Values use simple `NAME=value` lines, with no quoting or expansion.
 
 ```powershell
+Copy-Item .env.example .env
+```
+
+Provision or verify one test account, then run the one-shot Heart Rate command:
+
+```powershell
+go run . provision --from 1 --to 1
 go run . heart-rate --account 1
 ```
 
-This command logs in as `loadtest-0001@vitaloom.test`, submits one Heart Rate batch, and reads that account's summary through the same Nginx URL. Provision the account first if needed.
+The Heart Rate command logs in as `loadtest-0001@vitaloom.test`, submits one Heart Rate batch, and reads that account's summary through the configured Nginx URL. Provision the account first if needed.
 
 To schedule one measurement per device independently from batch flushes, use positive intervals and an optional duration. The duration starts after login; `0s` runs until Ctrl+C. Scheduled Heart Rate runs keep at most 1,000 outstanding events, send batches of up to 500, and drain pending events for up to five seconds on shutdown.
 
@@ -100,30 +107,9 @@ Every option can also be configured with its corresponding `VITALOOM_*` environm
 
 ## Provision test accounts
 
-Start Nginx and the Backend, then open PowerShell in the Producer repo.
+Start Nginx and the Backend, then run `go run . provision --from 1 --to 1` from the Producer repo. The account password must be at least 8 characters. If the account already exists, use its current password. Look for `count=1`; repeat the command to verify login.
 
-1. **Set the test Nginx URL.** Change it below if your listener uses a different port or hostname.
-
-   ```powershell
-   $env:VITALOOM_API_BASE_URL = 'http://localhost'
-   ```
-
-2. **Try one account.** Enter a test password of at least 8 characters when prompted. If `loadtest-0001@vitaloom.test` already exists, enter its current password.
-
-   ```powershell
-   $securePassword = Read-Host 'Test account password' -AsSecureString
-   $env:VITALOOM_TEST_PASSWORD = (New-Object System.Net.NetworkCredential('', $securePassword)).Password
-   try {
-       go run . provision --from 1 --to 1
-   } finally {
-       Remove-Item Env:VITALOOM_TEST_PASSWORD -ErrorAction SilentlyContinue
-       Remove-Variable securePassword -ErrorAction SilentlyContinue
-   }
-   ```
-
-3. **Look for `count=1`.** Repeat step 2 with the same password to verify that the account can log in.
-
-To provision all 1,000 test accounts, replace the command inside `try` with `go run . provision`.
+To provision all 1,000 test accounts, run `go run . provision`.
 
 ## Development checks
 
