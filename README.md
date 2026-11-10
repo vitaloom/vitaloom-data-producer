@@ -73,32 +73,33 @@ After editing `.env`, provision the accounts you need (`go run . provision` crea
 go run . provision --from 1 --to 10
 ```
 
-Run both metrics together, or use `step` or `heart-rate` for a single metric. Steps are generated every second; their batch interval controls flushes. Heart Rate without scheduling flags submits one batch and reads the summary; scheduling flags enable its scheduler. The multi-user example requires ten provisioned accounts.
+Without a selector, the Producer runs both metrics. Use `step` or `heart-rate` to run one metric. Both sample once per second; `--batch-interval` controls when each stream flushes. Every run uses authenticated scheduled ingestion. The multi-user example requires ten provisioned accounts.
 
 ```powershell
 go run . --account 1 --duration 30s
 go run . step --account 1 --duration 30s
-go run . heart-rate --account 1 --measurement-interval 1s --batch-interval 5s --duration 30s
-go run . heart-rate --virtual-users 10 --ramp-up 5s --duration 20s --measurement-interval 1s --batch-interval 5s
+go run . heart-rate --account 1 --batch-interval 5s --duration 30s
+go run . --virtual-users 10 --ramp-up 5s --duration 20s --batch-interval 5s
 ```
 
-Options and defaults:
+Options and defaults. Flags take precedence over environment values, which take precedence over defaults. `--batch-interval` takes precedence over the compatibility alias `--interval`; at the environment level `VITALOOM_BATCH_INTERVAL` takes precedence over `VITALOOM_INTERVAL`.
 
-| Scope | Option | Default | Description |
+| Option | Default | Description |
 |---|---|---:|---|
-| Combined | `--account` | `1` | Provisioned account (1–1000) |
-| Combined | `--api-base-url` | required | Authorized test Nginx URL |
-| Combined, `step` | `--batch-size` | `5` | Events per batch (1–500) |
-| Combined | `--interval` | `5s` | Flush interval for both metrics |
-| Combined, `step` | `--duration` | `0s` | Run duration; `0s` runs until stopped |
-| `step` | `--batch-interval` | `5s` | Steps flush interval; uses `VITALOOM_BATCH_INTERVAL` or falls back to `VITALOOM_INTERVAL` |
-| `heart-rate` | `--measurement-interval` | `1s` | Scheduled measurement interval |
-| `heart-rate` | `--batch-interval` | `5s` | Scheduled batch flush interval |
-| `heart-rate` | `--virtual-users` | required | Multi-user account count (1–1000) |
-| `heart-rate` | `--ramp-up` | `0s` | Multi-user ramp; must be less than the positive duration |
-| `heart-rate` | `--devices-per-user` | `1` | Only one device per user is supported |
+| `--api-base-url` | required | Authorized test Nginx URL; can also use `VITALOOM_API_BASE_URL` |
+| `--account` | `1` | Provisioned account index (1–1000); mutually exclusive with `--virtual-users` |
+| `--virtual-users` | unset | Run accounts 1 through N (1–1000); can also use `VITALOOM_VIRTUAL_USERS` |
+| `--devices-per-user` | `1` | Only one simulated device per account is supported |
+| `--ramp-up` | `0s` | Stagger VU starts; can also use `VITALOOM_RAMP_UP` |
+| `--batch-size` | `5` | Maximum events in each metric request (1–500) |
+| `--batch-interval` | `5s` | Shared flush cadence for every selected metric; can use `VITALOOM_BATCH_INTERVAL` |
+| `--interval` | alias | Compatibility alias for `--batch-interval`; environment fallback `VITALOOM_INTERVAL` |
+| `--duration` | `0s` | Run until stopped when zero; can also use `VITALOOM_DURATION` |
+| `--timeout` | `5s` | Per-request timeout; can also use `VITALOOM_TIMEOUT` |
+| `--max-retries` | `3` | Retries after the initial request (0–10); can also use `VITALOOM_MAX_RETRIES` |
+| `--retry-delay` | `500ms` | Delay between retry attempts; can also use `VITALOOM_RETRY_DELAY` |
 
-`--interval` applies to both streams in combined mode; single-metric commands use `--batch-interval`. Combined mode and `step` accept `VITALOOM_BATCH_SIZE` and `VITALOOM_DURATION`; combined `--interval` uses `VITALOOM_INTERVAL`, while Steps uses `VITALOOM_BATCH_INTERVAL` (falling back to `VITALOOM_INTERVAL`). Set `VITALOOM_API_BASE_URL` for `step`; combined mode needs it unless overridden by `--api-base-url`. Both require `VITALOOM_TEST_PASSWORD`. Transport settings are environment-only: `VITALOOM_TIMEOUT` defaults to `5s`, `VITALOOM_MAX_RETRIES` to `3` retries (0–10), and `VITALOOM_RETRY_DELAY` to `500ms`.
+All runs use one-second observations. There is no configurable measurement interval. `VITALOOM_TEST_PASSWORD` is required for every run. `provision` remains a separate account setup command.
 
 ## Development checks
 
