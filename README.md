@@ -61,55 +61,45 @@ Do not change payload fields, response handling, event identity or timestamp sem
 
 ## Run locally
 
-From the repository root, copy `.env.example` to `.env`, set `VITALOOM_TEST_PASSWORD` to the password for your authorized test accounts, and adjust `VITALOOM_API_BASE_URL` if needed. The CLI reads `.env` from its current directory; process environment variables take precedence. Values use simple `NAME=value` lines, with no quoting or expansion.
+From the repository root, copy `.env.example` to `.env`, then set `VITALOOM_API_BASE_URL` to your authorized test Nginx URL and `VITALOOM_TEST_PASSWORD` to a password of at least eight characters. The CLI reads `.env` from its current directory; process environment variables take precedence. Values use simple `NAME=value` lines, without quoting or expansion. Provision accounts `1`–`1000` as needed; existing accounts keep their current password.
 
 ```powershell
 Copy-Item .env.example .env
 ```
 
-Provision or verify one test account, then run the one-shot Heart Rate command:
+After editing `.env`, provision the accounts you need (`go run . provision` creates all 1,000):
 
 ```powershell
-go run . provision --from 1 --to 1
-go run . heart-rate --account 1
+go run . provision --from 1 --to 10
 ```
 
-The Heart Rate command logs in as `loadtest-0001@vitaloom.test`, submits one Heart Rate batch, and reads that account's summary through the configured Nginx URL. Provision the account first if needed.
-
-To schedule one measurement per device independently from batch flushes, use positive intervals and an optional duration. The duration starts after login; `0s` runs until Ctrl+C. Scheduled Heart Rate runs keep at most 1,000 outstanding events, send batches of up to 500, and drain pending events for up to five seconds on shutdown.
+Without a selector, the Producer runs both metrics. Use `step` or `heart-rate` to run one metric. Both sample once per second; `--batch-interval` controls when each stream flushes. Every run uses authenticated scheduled ingestion. The multi-user example requires ten provisioned accounts.
 
 ```powershell
-go run . heart-rate --account 1 --measurement-interval 1s --batch-interval 5s --duration 30s
+go run . --account 1 --duration 30s
+go run . step --account 1 --duration 30s
+go run . heart-rate --account 1 --batch-interval 5s --duration 30s
+go run . --virtual-users 10 --ramp-up 5s --duration 20s --batch-interval 5s
 ```
 
-Scheduled mode defaults to a `1s` measurement interval and `5s` batch interval. Supplying none of the scheduling flags keeps the one-shot command above.
-
-Use `--virtual-users` to select how many provisioned accounts to run. The Producer logs in to those accounts one at a time before the timer starts. Each uses its own token and device. The duration includes ramp-up, and `--devices-per-user` accepts `1`.
-
-```powershell
-go run . heart-rate --virtual-users 1 --ramp-up 0s --duration 20s --measurement-interval 1s --batch-interval 5s
-go run . heart-rate --virtual-users 10 --ramp-up 5s --duration 20s --measurement-interval 1s --batch-interval 5s
-```
-
-The following flags belong to the legacy simulator command:
+Options and defaults. Flags take precedence over environment values, which take precedence over defaults. `--batch-interval` takes precedence over the compatibility alias `--interval`; at the environment level `VITALOOM_BATCH_INTERVAL` takes precedence over `VITALOOM_INTERVAL`.
 
 | Option | Default | Description |
-|---|---:|---|
-| `--api-base-url` | `http://localhost` | Backend/API base URL |
-| `--batch-size` | `5` | Events per metric batch (1–500) |
-| `--interval` | `5s` | Delay between batch cycles |
-| `--duration` | `0s` | Unlimited until stopped |
-| `--timeout` | `5s` | HTTP attempt timeout |
-| `--max-retries` | `3` | Retries after the initial attempt (0–10) |
-| `--retry-delay` | `500ms` | Delay between retries |
+|---|---|---:|---|
+| `--api-base-url` | required | Authorized test Nginx URL; can also use `VITALOOM_API_BASE_URL` |
+| `--account` | `1` | Provisioned account index (1–1000); mutually exclusive with `--virtual-users` |
+| `--virtual-users` | unset | Run accounts 1 through N (1–1000); can also use `VITALOOM_VIRTUAL_USERS` |
+| `--devices-per-user` | `1` | Only one simulated device per account is supported |
+| `--ramp-up` | `0s` | Stagger VU starts; can also use `VITALOOM_RAMP_UP` |
+| `--batch-size` | `5` | Maximum events in each metric request (1–500) |
+| `--batch-interval` | `5s` | Shared flush cadence for every selected metric; can use `VITALOOM_BATCH_INTERVAL` |
+| `--interval` | alias | Compatibility alias for `--batch-interval`; environment fallback `VITALOOM_INTERVAL` |
+| `--duration` | `0s` | Run until stopped when zero; can also use `VITALOOM_DURATION` |
+| `--timeout` | `5s` | Per-request timeout; can also use `VITALOOM_TIMEOUT` |
+| `--max-retries` | `3` | Retries after the initial request (0–10); can also use `VITALOOM_MAX_RETRIES` |
+| `--retry-delay` | `500ms` | Delay between retry attempts; can also use `VITALOOM_RETRY_DELAY` |
 
-Every option can also be configured with its corresponding `VITALOOM_*` environment variable, for example `VITALOOM_API_BASE_URL` and `VITALOOM_BATCH_SIZE`.
-
-## Provision test accounts
-
-Start Nginx and the Backend, then run `go run . provision --from 1 --to 1` from the Producer repo. The account password must be at least 8 characters. If the account already exists, use its current password. Look for `count=1`; repeat the command to verify login.
-
-To provision all 1,000 test accounts, run `go run . provision`.
+All runs use one-second observations. There is no configurable measurement interval. `VITALOOM_TEST_PASSWORD` is required for every run. `provision` remains a separate account setup command.
 
 ## Development checks
 

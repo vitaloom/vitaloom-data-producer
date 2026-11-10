@@ -13,18 +13,11 @@ type HeartRateEvent struct {
 	OccurredAt   time.Time `json:"occurredAt"`
 	HeartRateBPM int       `json:"heartRateBpm"`
 }
-type HeartRateBatch struct {
-	RunID  string           `json:"runId"`
-	Events []HeartRateEvent `json:"events"`
-}
+
 type StepEvent struct {
 	EventID    string    `json:"eventId"`
 	OccurredAt time.Time `json:"occurredAt"`
 	StepsDelta int       `json:"stepsDelta"`
-}
-type StepBatch struct {
-	RunID  string      `json:"runId"`
-	Events []StepEvent `json:"events"`
 }
 
 type EventGenerator struct {
@@ -32,7 +25,12 @@ type EventGenerator struct {
 	startedAt time.Time
 	rng       *mathrand.Rand
 	heartSeq  uint64
-	stepsSeq  uint64
+}
+
+type StepEventGenerator struct {
+	runID string
+	rng   *mathrand.Rand
+	seq   uint64
 }
 
 func NewEventGenerator(runID string, startedAt time.Time, rng *mathrand.Rand) *EventGenerator {
@@ -41,6 +39,14 @@ func NewEventGenerator(runID string, startedAt time.Time, rng *mathrand.Rand) *E
 	}
 	return &EventGenerator{runID: runID, startedAt: startedAt.UTC(), rng: rng}
 }
+
+func NewStepEventGenerator(runID string, rng *mathrand.Rand) *StepEventGenerator {
+	if rng == nil {
+		rng = mathrand.New(mathrand.NewSource(time.Now().UnixNano()))
+	}
+	return &StepEventGenerator{runID: runID, rng: rng}
+}
+
 func NewRunID(now time.Time) (string, error) {
 	var random [6]byte
 	if _, err := cryptorand.Read(random[:]); err != nil {
@@ -48,32 +54,7 @@ func NewRunID(now time.Time) (string, error) {
 	}
 	return fmt.Sprintf("run-%s-%s", now.UTC().Format("20060102T150405Z"), hex.EncodeToString(random[:])), nil
 }
-func (g *EventGenerator) NextBatch(batchSize int, now time.Time, interval time.Duration) (HeartRateBatch, StepBatch) {
-	heartBatch := HeartRateBatch{RunID: g.runID, Events: make([]HeartRateEvent, 0, batchSize)}
-	stepBatch := StepBatch{RunID: g.runID, Events: make([]StepEvent, 0, batchSize)}
-	spacing := interval / time.Duration(batchSize)
-	if spacing <= 0 {
-		spacing = time.Nanosecond
-	}
-	batchNow := now.UTC()
-	for i := 0; i < batchSize; i++ {
-		occurredAt := batchNow.Add(-time.Duration(batchSize-1-i) * spacing)
-		phase := g.activityPhase(occurredAt)
-		g.heartSeq++
-		heartBatch.Events = append(heartBatch.Events, HeartRateEvent{EventID: fmt.Sprintf("hr-%s-%06d", g.runID, g.heartSeq), OccurredAt: occurredAt, HeartRateBPM: g.heartRateFor(phase)})
-		g.stepsSeq++
-		stepBatch.Events = append(stepBatch.Events, StepEvent{EventID: fmt.Sprintf("steps-%s-%06d", g.runID, g.stepsSeq), OccurredAt: occurredAt, StepsDelta: g.stepsFor(phase)})
-	}
-	return heartBatch, stepBatch
-}
-func (g *EventGenerator) nextHeartRateEvent(occurredAt time.Time, phase int) HeartRateEvent {
-	g.heartSeq++
-	return HeartRateEvent{
-		EventID:      fmt.Sprintf("hr-%s-%06d", g.runID, g.heartSeq),
-		OccurredAt:   occurredAt,
-		HeartRateBPM: g.heartRateFor(phase),
-	}
-}
+
 func (g *EventGenerator) activityPhase(at time.Time) int {
 	elapsed := at.Sub(g.startedAt)
 	if elapsed < 0 {
@@ -81,6 +62,12 @@ func (g *EventGenerator) activityPhase(at time.Time) int {
 	}
 	return int(elapsed/(15*time.Second)) % 3
 }
+
+func (g *EventGenerator) nextHeartRateEvent(occurredAt time.Time, phase int) HeartRateEvent {
+	g.heartSeq++
+	return HeartRateEvent{EventID: fmt.Sprintf("hr-%s-%06d", g.runID, g.heartSeq), OccurredAt: occurredAt.UTC().Truncate(time.Millisecond), HeartRateBPM: g.heartRateFor(phase)}
+}
+
 func (g *EventGenerator) heartRateFor(phase int) int {
 	var minBPM, maxBPM int
 	switch phase {
@@ -93,13 +80,21 @@ func (g *EventGenerator) heartRateFor(phase int) int {
 	}
 	return minBPM + g.rng.Intn(maxBPM-minBPM+1)
 }
-func (g *EventGenerator) stepsFor(phase int) int {
-	switch phase {
-	case 1:
-		return 4 + g.rng.Intn(12)
-	case 2:
-		return 12 + g.rng.Intn(17)
-	default:
-		return g.rng.Intn(3)
+
+func (g *StepEventGenerator) Next(at time.Time) (StepEvent, bool) {
+	delta := 0
+	if g.seq == 0 {
+		delta = 1 + g.rng.Intn(5)
+	} else {
+		delta = g.rng.Intn(6)
 	}
+	return makeStepEvent(g.runID, &g.seq, delta, at)
+}
+
+func makeStepEvent(runID string, sequence *uint64, delta int, at time.Time) (StepEvent, bool) {
+	if delta < 1 || delta > 5 {
+		return StepEvent{}, false
+	}
+	*sequence++
+	return StepEvent{EventID: fmt.Sprintf("steps-%s-%06d", runID, *sequence), OccurredAt: at.UTC().Truncate(time.Millisecond), StepsDelta: delta}, true
 }

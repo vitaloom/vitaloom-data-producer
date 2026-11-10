@@ -1,8 +1,8 @@
 # Producer Simulation & Load Generation Design
 
-**Status:** Proposed direction for the next development stages  
+**Status:** Current shared run model and future load-reporting direction
 **Scope:** Synthetic Heart Rate and Steps data sent to VitaLoom Backend  
-**Implementation status:** The current repository is a single-run simulator. Multi-account orchestration and multi-user load generation are not implemented yet.
+**Implementation status:** The CLI supports combined or single-metric authenticated runs, pre-warmed account sessions, one device per account, bounded batches and multi-user ramp-up.
 
 This document records the intended direction for the Data Producer so implementation can proceed incrementally without redesigning the tool for each metric.
 
@@ -17,7 +17,7 @@ The Producer must send all API traffic through the configured **Nginx base URL**
 
 The Producer never connects to MongoDB or writes to Backend persistence directly. Backend remains authoritative for authentication, validation, persistence, deduplication and aggregation.
 
-Heart Rate is the first implementation target. Steps should reuse the same scheduling, batching, HTTP, authentication and reporting capabilities after the Heart Rate path is aligned with the canonical API contract.
+Heart Rate and Steps share scheduling, batching, HTTP, authentication and run coordination while retaining metric-specific payloads, validation and response handling.
 
 ## 2. Concepts and responsibilities
 
@@ -162,14 +162,13 @@ The Producer should support a simple one-VU/one-device run as well as a multi-VU
 
 ## 6. Target CLI configuration
 
-The following is the proposed user-facing shape, **not a command supported by the current implementation yet**:
+The supported user-facing shape is:
 
 ```bash
-producer run \
+producer [step|heart-rate] \
   --virtual-users 1000 \
   --devices-per-user 1 \
   --batch-interval 5s \
-  --measurement-interval 1s \
   --ramp-up 30s \
   --duration 10m
 ```
@@ -180,8 +179,7 @@ The Nginx ingress URL is supplied separately, for example through `VITALOOM_API_
 |---|---|
 | `--virtual-users` | Number of test accounts/VUs in the scenario; initial target is 1,000. |
 | `--devices-per-user` | Number of independent simulated devices per VU; initially 1. |
-| `--measurement-interval` | Time between generated measurements for each device. |
-| `--batch-interval` | How often each device flushes pending measurements through Nginx to the Backend. |
+| `--batch-interval` | Shared cadence for flushing each selected metric through Nginx to the Backend. Both metric observation schedules are fixed at one second. |
 | `--ramp-up` | Time over which VUs are introduced gradually instead of starting all at once. |
 | `--duration` | Length of the bounded scenario run; initial proposal is 10 minutes including ramp-up. |
 
@@ -189,9 +187,8 @@ The existing `--timeout`, `--max-retries` and `--retry-delay` settings remain re
 
 ### Timing semantics
 
-- **Measurement interval** controls data-generation frequency.
-- **Batch interval** controls network submission frequency.
-- They are independent. For example, a 1-second measurement interval and 5-second batch interval normally produces about five measurements per device per batch.
+- Heart Rate and Steps observe once per second.
+- **Batch interval** controls network submission frequency independently of observation frequency. A 5-second batch interval normally queues about five observations per device per metric per request.
 - A device should retain pending events until they are submitted or the run is stopped according to the agreed shutdown policy.
 - Retry must reuse the same logical events, IDs and timestamps. A retry must not generate replacement measurements.
 - Initial flush times should be distributed across the batch interval to avoid an accidental synchronized burst from all 1,000 VUs. A separate scenario may deliberately synchronize them when testing burst behavior.
@@ -242,18 +239,18 @@ The current code is intentionally smaller than the target design.
 
 | Area | Current state |
 |---|---|
-| Runtime model | One Producer process, one run ID, one generator and one API client. |
-| Metrics | Generates Heart Rate and Steps data in the same cycle. |
+| Runtime model | One run coordinator warms one session per account and runs one VU worker per account. |
+| Metrics | Selects Heart Rate, Steps or both; default is both. |
 | Generation | Synthetic values use simple hard-coded activity phases. |
-| Timing | One `--interval` controls batch cycles. Event timestamps are distributed within a batch using `interval / batchSize`; there is no independent measurement scheduler. |
-| Sending | Heart Rate and Steps batches are sent sequentially. |
-| Authentication | No login/token pool or Bearer token support in the current Producer client. |
-| Network | Current API base URL is used directly by the client; Nginx ingress is not yet an explicit documented/runtime requirement in the implementation. |
-| Retry | Bounded HTTP retries; the same serialized body is reused within the current process. HTTP 429 is retryable with the current fixed delay; `Retry-After` is not parsed. |
-| Reporting | Per-batch logs and a run summary with generated, accepted, duplicate, retry and failure counts. |
+| Timing | Both metrics sample every second. `--batch-interval` controls flushes; `--interval` remains an alias. |
+| Sending | Each metric has its own queue, endpoint, response validation and stable retry body; flushes split at the configured batch cap. |
+| Authentication | Accounts are warmed before timing; Heart Rate and Steps share each VU's session with synchronized refresh. |
+| Network | All requests use the configured Nginx base URL and shared HTTP transport settings. |
+| Retry | Bounded HTTP retries reuse each serialized request body. HTTP 429 is retryable and Heart Rate honors bounded `Retry-After`. |
+| Reporting | Per-batch and per-VU summary logs include accepted, duplicate, rejected and unconfirmed outcomes. |
 | Tests / CI | Unit tests cover configuration, generation, client behavior and producer lifecycle. GitHub Actions runs test, vet and build. |
 
-Current CLI options are `--api-base-url`, `--batch-size`, `--interval`, `--duration`, `--timeout`, `--max-retries` and `--retry-delay`. The current entry point does not have a `producer run` subcommand.
+The CLI supports `--api-base-url`, `--account` or `--virtual-users`, `--devices-per-user`, `--ramp-up`, `--batch-size`, `--batch-interval` (and `--interval` as an alias), `--duration`, `--timeout`, `--max-retries` and `--retry-delay`. The metric selector is optional; without one, both streams run.
 
 ### Contract alignment required before the next Heart Rate integration run
 
