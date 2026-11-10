@@ -69,6 +69,13 @@ go run . heart-rate --account 1 --measurement-interval 1s --batch-interval 5s --
 
 Scheduled mode defaults to a `1s` measurement interval and `5s` batch interval. Supplying none of the scheduling flags keeps the one-shot command above.
 
+Use `--virtual-users` to select how many provisioned accounts to run. The Producer logs in to those accounts one at a time before the timer starts. Each uses its own token and device. The duration includes ramp-up, and `--devices-per-user` accepts `1`.
+
+```powershell
+go run . heart-rate --virtual-users 1 --ramp-up 0s --duration 20s --measurement-interval 1s --batch-interval 5s
+go run . heart-rate --virtual-users 10 --ramp-up 5s --duration 20s --measurement-interval 1s --batch-interval 5s
+```
+
 The following flags belong to the legacy simulator command:
 
 | Option | Default | Description |

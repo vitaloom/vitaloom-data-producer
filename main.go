@@ -26,6 +26,18 @@ func run(args []string) error {
 	}
 	if len(args) > 0 && args[0] == "heart-rate" {
 		logger := log.New(os.Stdout, "[vitaloom-producer] ", log.LstdFlags|log.LUTC)
+		if hasVirtualUsersFlag(args[1:]) {
+			options, cfg, password, err := parseHeartRateMultiUserCommand(args[1:], os.Getenv)
+			if err != nil {
+				if errors.Is(err, flag.ErrHelp) {
+					return nil
+				}
+				return err
+			}
+			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+			defer stop()
+			return runHeartRateMultiUser(ctx, cfg, password, options, logger)
+		}
 		cfg, password, accountIndex, measurementInterval, batchInterval, duration, scheduled, err := parseHeartRateCommand(args[1:], os.Getenv)
 		if err != nil {
 			if errors.Is(err, flag.ErrHelp) {

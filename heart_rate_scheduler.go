@@ -74,6 +74,10 @@ func runHeartRateScheduleUntil(ctx context.Context, duration <-chan time.Time, m
 }
 
 func runHeartRateScheduleWithStop(ctx context.Context, duration <-chan time.Time, measurementTicks, batchTicks <-chan time.Time, runID string, accountIndex int, generator *EventGenerator, send heartRateSendFunc, logger *log.Logger, stopTickers func()) error {
+	return runHeartRateScheduleTimed(ctx, duration, measurementTicks, batchTicks, 0, 0, runID, accountIndex, generator, send, logger, stopTickers)
+}
+
+func runHeartRateScheduleTimed(ctx context.Context, duration <-chan time.Time, measurementTicks, batchTicks <-chan time.Time, batchInterval, firstBatchDelay time.Duration, runID string, accountIndex int, generator *EventGenerator, send heartRateSendFunc, logger *log.Logger, stopTickers func()) error {
 	sendCtx, cancelSend := context.WithCancel(context.WithoutCancel(ctx))
 	defer cancelSend()
 	deviceID := fmt.Sprintf("device-loadtest-%04d", accountIndex)
@@ -85,6 +89,13 @@ func runHeartRateScheduleWithStop(ctx context.Context, duration <-chan time.Time
 	ctxDone := ctx.Done()
 	var drainTimer *time.Timer
 	var drainTimeout <-chan time.Time
+	var phaseTimer *time.Timer
+	var batchTimerTicks <-chan time.Time
+	if batchInterval > 0 {
+		phaseTimer = time.NewTimer(firstBatchDelay)
+		batchTimerTicks = phaseTimer.C
+		batchTicks = nil
+	}
 	draining := false
 	flushPending := false
 	launch := func(events []HeartRateEvent) {
@@ -104,6 +115,7 @@ func runHeartRateScheduleWithStop(ctx context.Context, duration <-chan time.Time
 			drainTimeout = drainTimer.C
 			measurementTicks = nil
 			batchTicks = nil
+			batchTimerTicks = nil
 			ctxDone = nil
 			stopTickers()
 		}
@@ -114,6 +126,9 @@ func runHeartRateScheduleWithStop(ctx context.Context, duration <-chan time.Time
 	finish := func(err error) error {
 		if drainTimer != nil {
 			drainTimer.Stop()
+		}
+		if phaseTimer != nil {
+			phaseTimer.Stop()
 		}
 		stats.QueuedUnsent = len(queue)
 		if active != nil {
@@ -186,6 +201,19 @@ func runHeartRateScheduleWithStop(ctx context.Context, duration <-chan time.Time
 			event := generator.nextHeartRateEvent(createdAt, phase)
 			queue = append(queue, event)
 			stats.Generated++
+		case <-batchTimerTicks:
+			if !draining {
+				flushPending = true
+				if active == nil && len(queue) > 0 {
+					n := min(maxBatchSize, len(queue))
+					launch(queue[:n])
+					queue = queue[n:]
+					flushPending = false
+				}
+				phaseTimer.Reset(batchInterval)
+			} else {
+				batchTimerTicks = nil
+			}
 		case <-batchTicks:
 			if !draining {
 				flushPending = true
