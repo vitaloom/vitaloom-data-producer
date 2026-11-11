@@ -233,12 +233,16 @@ func (c *AuthClient) post(ctx context.Context, endpoint string, expectedStatus i
 
 func authStatusError(status int, body []byte) *AuthStatusError {
 	var envelope struct {
+		Code  string `json:"code"`
 		Error struct {
 			Code string `json:"code"`
 		} `json:"error"`
 	}
 	_ = json.Unmarshal(body, &envelope)
-	code := envelope.Error.Code
+	code := envelope.Code
+	if code == "" {
+		code = envelope.Error.Code
+	}
 	switch code {
 	case "EMAIL_ALREADY_REGISTERED", "INVALID_CREDENTIALS", "INVALID_REFRESH_TOKEN", "VALIDATION_ERROR":
 		return &AuthStatusError{StatusCode: status, Code: code}

@@ -45,8 +45,9 @@ func TestProvisionCreatesAndVerifiesExistingAccounts(t *testing.T) {
 		case "/api/auth/register":
 			registrations++
 			if _, exists := accounts[body.Email]; exists {
+				w.Header().Set("Content-Type", "application/problem+json")
 				w.WriteHeader(http.StatusConflict)
-				_, _ = io.WriteString(w, `{"error":{"code":"EMAIL_ALREADY_REGISTERED","message":"duplicate"}}`)
+				_, _ = io.WriteString(w, `{"type":"about:blank","title":"Conflict","status":409,"detail":"An account with this email already exists.","instance":"/api/auth/register","code":"EMAIL_ALREADY_REGISTERED"}`)
 				return
 			}
 			accounts[body.Email] = body.Password
