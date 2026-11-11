@@ -85,7 +85,7 @@ go run . --virtual-users 10 --ramp-up 5s --duration 20s --batch-interval 5s
 Options and defaults. Flags take precedence over environment values, which take precedence over defaults. `--batch-interval` takes precedence over the compatibility alias `--interval`; at the environment level `VITALOOM_BATCH_INTERVAL` takes precedence over `VITALOOM_INTERVAL`.
 
 | Option | Default | Description |
-|---|---|---:|---|
+|---|---:|---|
 | `--api-base-url` | required | Authorized test Nginx URL; can also use `VITALOOM_API_BASE_URL` |
 | `--account` | `1` | Provisioned account index (1–1000); mutually exclusive with `--virtual-users` |
 | `--virtual-users` | unset | Run accounts 1 through N (1–1000); can also use `VITALOOM_VIRTUAL_USERS` |
