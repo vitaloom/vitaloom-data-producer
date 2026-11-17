@@ -168,7 +168,7 @@ The supported user-facing shape is:
 producer [step|heart-rate] \
   --virtual-users 1000 \
   --devices-per-user 1 \
-  --batch-interval 5s \
+  --sync-interval 60s \
   --ramp-up 30s \
   --duration 10m
 ```
@@ -179,7 +179,9 @@ The Nginx ingress URL is supplied separately, for example through `VITALOOM_API_
 |---|---|
 | `--virtual-users` | Number of test accounts/VUs in the scenario; initial target is 1,000. |
 | `--devices-per-user` | Number of independent simulated devices per VU; initially 1. |
-| `--batch-interval` | Shared cadence for flushing each selected metric through Nginx to the Backend. Both metric observation schedules are fixed at one second. |
+| `--heart-rate-interval` | Heart Rate sampling cadence; defaults to 300 seconds. |
+| `--steps-aggregation-interval` | Steps aggregation window; defaults to 60 seconds and must be a whole-second duration from 1 second to 1 hour. |
+| `--sync-interval` | Shared request sync cadence; defaults to 60 seconds. `--batch-interval` and `--interval` remain compatibility aliases. |
 | `--ramp-up` | Time over which VUs are introduced gradually instead of starting all at once. |
 | `--duration` | Length of the bounded scenario run; initial proposal is 10 minutes including ramp-up. |
 
@@ -187,18 +189,19 @@ The existing `--timeout`, `--max-retries` and `--retry-delay` settings remain re
 
 ### Timing semantics
 
-- Heart Rate and Steps observe once per second.
-- **Batch interval** controls network submission frequency independently of observation frequency. A 5-second batch interval normally queues about five observations per device per metric per request.
-- A device should retain pending events until they are submitted or the run is stopped according to the agreed shutdown policy.
+- Heart Rate sampling and Steps aggregation use independent schedules. Heart Rate defaults to one observation every 300 seconds. Steps use the existing per-second simulator internally and aggregate into 60-second intervals by default.
+- **Sync interval** controls network submission independently from generation and aggregation. Each VU receives a stable per-run phase within a deterministic stratum, with bounded jitter around its slot midpoint, avoiding synchronized requests by default.
+- A Steps interval uses `[startAt,endAt)` and never crosses a local hour boundary in `Asia/Ho_Chi_Minh`; windows close at the configured aggregation duration or at the hour boundary. Backend permits an end exactly on that boundary.
+- On shutdown, the Producer finalizes a positive whole-second Steps prefix using its last observed tick, then drains queued events. The open tail is never extended to wall-clock shutdown time. Zero-step intervals are omitted.
+- Startup does not emit an immediate observation. The first Heart Rate event follows the configured sampling interval. Runs shorter than one internal Steps tick have no Steps event; a shorter-than-configured run can send a partial Steps interval during shutdown and may contain no Heart Rate event.
 - Retry must reuse the same logical events, IDs and timestamps. A retry must not generate replacement measurements.
-- Initial flush times should be distributed across the batch interval to avoid an accidental synchronized burst from all 1,000 VUs. A separate scenario may deliberately synchronize them when testing burst behavior.
 
 ## 7. Identity, timestamps and retry behavior
 
 - A device ID identifies the simulated device and remains stable across Producer runs when the same device is reused.
 - A run ID identifies one Producer execution and is diagnostic metadata; it is not device identity or measurement identity.
 - Every measurement has a stable event ID. It is created once and reused for all retries of that measurement.
-- `occurredAt` represents the simulated measurement time and is sent in UTC. It is independent of the time at which the Producer sends the batch.
+- Heart Rate `occurredAt` and Steps interval `startAt`/`endAt` represent simulation time in UTC, independent of batch submission time. Steps interval events omit `occurredAt`.
 - Backend creates `receivedAt`; the Producer must not send or control it.
 - The Producer must not infer acceptance from an HTTP success alone. It should parse the metric-specific response and account for accepted, duplicate and rejected outcomes.
 - Rate-limit responses (HTTP 429) and exhausted retries must remain visible in the run report.
@@ -221,13 +224,13 @@ The load-generation mode should report enough information to understand both gen
 | Failures and retries | HTTP failures, exhausted retries and retry attempts. |
 | Run summary | Configuration, elapsed time, totals and final status. |
 
-CCU, RPS and measurement throughput are different measurements. The number of VUs alone does not determine request rate; device count, metric count, measurement interval, batch interval and Nginx policy all affect observed traffic.
+CCU, RPS and measurement throughput are different measurements. The number of VUs alone does not determine request rate; device count, metric count, sampling, aggregation, sync intervals and Nginx policy all affect observed traffic.
 
-For a simplified scenario with 1,000 active devices, a 5-second batch interval and one request per device per interval:
+For a simplified scenario with 1,000 active devices, 60-second sync and aggregation intervals, and one event per completed interval:
 
-- Heart Rate alone produces approximately 200 batch requests/second.
-- If both Heart Rate and Steps each send one batch per device per interval, the combined rate is approximately 400 requests/second (about 200 per endpoint).
-- With a 1-second measurement interval, Heart Rate generates approximately 1,000 measurements/second; both metrics together generate approximately 2,000 metric events/second.
+- Steps produces approximately 16.7 batch requests/second after startup.
+- Heart Rate at its 300-second default produces approximately 3.3 batch requests/second on average; VU phases spread requests across the sync period.
+- Steps simulates increments internally once per second, then emits one aggregate event per nonempty interval. Heart Rate generates about 3.3 observations/second across 1,000 devices on average.
 
 These are steady-state planning estimates, not guaranteed throughput. Ramp-up, request duration, retries, scheduling delays, Nginx rate limits, batch limits and Backend response times change the observed values.
 
@@ -242,7 +245,7 @@ The current code is intentionally smaller than the target design.
 | Runtime model | One run coordinator warms one session per account and runs one VU worker per account. |
 | Metrics | Selects Heart Rate, Steps or both; default is both. |
 | Generation | Synthetic values use simple hard-coded activity phases. |
-| Timing | Both metrics sample every second. `--batch-interval` controls flushes; `--interval` remains an alias. |
+| Timing | Heart Rate sampling defaults to 300s; Steps aggregate at 60s from per-second simulated increments; request sync defaults to 60s and uses staggered per-VU phases. `--batch-interval` and `--interval` are sync aliases. |
 | Sending | Each metric has its own queue, endpoint, response validation and stable retry body; flushes split at the configured batch cap. |
 | Authentication | Accounts are warmed before timing; Heart Rate and Steps share each VU's session with synchronized refresh. |
 | Network | All requests use the configured Nginx base URL and shared HTTP transport settings. |
@@ -250,7 +253,7 @@ The current code is intentionally smaller than the target design.
 | Reporting | Per-batch and per-VU summary logs include accepted, duplicate, rejected and unconfirmed outcomes. |
 | Tests / CI | Unit tests cover configuration, generation, client behavior and producer lifecycle. GitHub Actions runs test, vet and build. |
 
-The CLI supports `--api-base-url`, `--account` or `--virtual-users`, `--devices-per-user`, `--ramp-up`, `--batch-size`, `--batch-interval` (and `--interval` as an alias), `--duration`, `--timeout`, `--max-retries` and `--retry-delay`. The metric selector is optional; without one, both streams run.
+The CLI supports `--api-base-url`, `--account` or `--virtual-users`, `--devices-per-user`, `--ramp-up`, `--batch-size`, `--heart-rate-interval`, `--steps-aggregation-interval`, `--sync-interval`, `--batch-interval` and `--interval` (sync aliases), `--duration`, `--timeout`, `--max-retries` and `--retry-delay`. The metric selector is optional; without one, both streams run.
 
 ### Contract alignment required before the next Heart Rate integration run
 
@@ -260,7 +263,7 @@ The current Producer code predates the latest Heart Rate batch contract:
 - Its response decoder only understands `accepted` and `duplicates`; the current Heart Rate contract also returns `rejected` and per-item `results`.
 - The current client does not send Bearer credentials. Heart Rate currently requires authentication.
 - The current Producer must be configured to call the Nginx listener, not the Backend's direct Spring Boot port.
-- The current Steps payload/response follows the existing Steps contract; do not change it as part of Heart Rate alignment unless that contract is separately updated.
+- Steps supports legacy `occurredAt` events and interval events with `startAt`, `endAt` and `stepsDelta`; interval requests omit `occurredAt`.
 
 The canonical request/response definitions are maintained in the [Backend API Contract](https://github.com/vitaloom/vitaloom-backend/blob/main/docs/api/api-contract.md). This document must not become a competing API specification.
 

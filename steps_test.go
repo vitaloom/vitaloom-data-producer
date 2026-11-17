@@ -29,14 +29,42 @@ func TestStepGenerationBoundsSkipsZeroAndUsesUTCEventIdentity(t *testing.T) {
 	if !ok || first.StepsDelta < 1 || first.StepsDelta > 5 || first.EventID != "steps-run-test-000001" {
 		t.Fatalf("first event=%+v ok=%t", first, ok)
 	}
-	if first.OccurredAt.Location() != time.UTC || !first.OccurredAt.Equal(at.Truncate(time.Millisecond)) {
-		t.Fatalf("occurredAt=%s; expected UTC millisecond time", first.OccurredAt)
+	if first.OccurredAt == nil || first.OccurredAt.Location() != time.UTC || !first.OccurredAt.Equal(at.Truncate(time.Millisecond)) {
+		t.Fatalf("occurredAt=%v; expected UTC millisecond time", first.OccurredAt)
 	}
 	for i := 0; i < 1000; i++ {
 		event, present := generator.Next(at.Add(time.Duration(i+1) * time.Second))
 		if present && (event.StepsDelta < 1 || event.StepsDelta > 5) {
 			t.Fatalf("generated invalid increment %d", event.StepsDelta)
 		}
+	}
+}
+
+func TestStepsIntervalsUseWholeSecondsAndCloseAtHoChiMinhHourBoundary(t *testing.T) {
+	location := hoChiMinhLocation
+	start := time.Date(2026, 11, 10, 9, 59, 0, 0, location)
+	boundary := time.Date(2026, 11, 10, 10, 0, 0, 0, location)
+	afterBoundary := boundary.Add(time.Second)
+	if !shouldCloseStepsWindow(start, boundary, time.Hour) {
+		t.Fatal("Steps window ending exactly at local hour boundary remained open")
+	}
+	if shouldCloseStepsWindow(boundary, afterBoundary, time.Hour) {
+		t.Fatal("Steps window closed before aggregation duration or local hour boundary")
+	}
+	generator := NewStepEventGenerator("run-interval", rand.New(rand.NewSource(7)))
+	event, ok := generator.NextInterval(start, boundary, 300)
+	if !ok || event.EventID != "steps-run-interval-000001" || event.OccurredAt != nil || event.StartAt == nil || event.EndAt == nil || event.StepsDelta != 300 {
+		t.Fatalf("invalid interval event: %+v ok=%t", event, ok)
+	}
+	encoded, err := json.Marshal(event)
+	if err != nil || strings.Contains(string(encoded), `"occurredAt"`) || !strings.Contains(string(encoded), `"startAt"`) || !strings.Contains(string(encoded), `"endAt"`) {
+		t.Fatalf("interval JSON=%s err=%v", encoded, err)
+	}
+	if _, ok := generator.NextInterval(start, start.Add(500*time.Millisecond), 1); ok {
+		t.Fatal("accepted a fractional-second interval")
+	}
+	if _, ok := generator.NextInterval(start, start.Add(2*time.Second), 11); ok {
+		t.Fatal("accepted a delta above five steps per second")
 	}
 }
 
@@ -57,16 +85,21 @@ func TestStepsClientUsesExactContractRoutePayloadAndBearer(t *testing.T) {
 		}
 		var batch authenticatedStepsBatch
 		_ = json.Unmarshal(mustMarshal(t, raw), &batch)
-		if batch.DeviceID != "steps-device-0001" || batch.RunID != "run-steps" || len(batch.Events) != 1 || batch.Events[0].StepsDelta != 3 || batch.Events[0].OccurredAt.Location() != time.UTC {
+		if batch.DeviceID != "steps-device-0001" || batch.RunID != "run-steps" || len(batch.Events) != 1 || batch.Events[0].StepsDelta != 3 || batch.Events[0].OccurredAt != nil || batch.Events[0].StartAt == nil || batch.Events[0].EndAt == nil {
 			t.Errorf("unexpected decoded batch: %+v", batch)
+		}
+		if batch.Events[0].EndAt.Sub(*batch.Events[0].StartAt) != time.Minute {
+			t.Errorf("unexpected interval: %+v", batch.Events[0])
 		}
 		writeStepsResponse(w, batch, []string{"ACCEPTED"}, 1, 0, 0)
 	}))
 	defer server.Close()
 	client := newStepsClient(Config{APIBaseURL: server.URL, Timeout: time.Second}, nil)
-	batch := authenticatedStepsBatch{DeviceID: "steps-device-0001", RunID: "run-steps", Events: []StepEvent{{EventID: "steps-run-0001", OccurredAt: time.Date(2026, 11, 10, 1, 0, 1, 0, time.UTC), StepsDelta: 3}}}
+	startAt := time.Date(2026, 11, 10, 1, 0, 0, 0, time.UTC)
+	endAt := startAt.Add(time.Minute)
+	batch := authenticatedStepsBatch{DeviceID: "steps-device-0001", RunID: "run-steps", Events: []StepEvent{{EventID: "steps-run-0001", StartAt: &startAt, EndAt: &endAt, StepsDelta: 3}}}
 	encoded, err := json.Marshal(batch)
-	if err != nil || !strings.Contains(string(encoded), `"occurredAt":"2026-11-10T01:00:01Z"`) {
+	if err != nil || !strings.Contains(string(encoded), `"startAt":"2026-11-10T01:00:00Z"`) || !strings.Contains(string(encoded), `"endAt":"2026-11-10T01:01:00Z"`) || strings.Contains(string(encoded), `"occurredAt"`) {
 		t.Fatalf("JSON=%s err=%v", encoded, err)
 	}
 	if _, _, err := client.sendBatch(context.Background(), "steps-token", batch); err != nil {
@@ -105,9 +138,11 @@ func TestStepsClientRetriesIdenticalBatchAndRejectsInconsistentResponse(t *testi
 	}))
 	defer server.Close()
 	client := newStepsClient(Config{APIBaseURL: server.URL, Timeout: time.Second, MaxRetries: 2}, nil)
+	startAt := time.Now().UTC().Truncate(time.Second)
+	endAt := startAt.Add(time.Minute)
 	batch := authenticatedStepsBatch{DeviceID: "device", RunID: "run", Events: []StepEvent{
-		{EventID: "a", OccurredAt: time.Now().UTC().Truncate(time.Millisecond), StepsDelta: 1},
-		{EventID: "b", OccurredAt: time.Now().UTC().Truncate(time.Millisecond), StepsDelta: 2},
+		{EventID: "a", StartAt: &startAt, EndAt: &endAt, StepsDelta: 1},
+		{EventID: "b", StartAt: &startAt, EndAt: &endAt, StepsDelta: 2},
 	}}
 	if _, _, err := client.sendBatch(context.Background(), "retry-token", batch); err != nil {
 		t.Fatalf("sendBatch() error = %v", err)

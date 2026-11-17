@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"hash/fnv"
 	"log"
 	"net/url"
 	"os"
@@ -30,15 +31,17 @@ const (
 )
 
 type RunPlan struct {
-	Metrics        MetricSelection
-	AccountIndex   int
-	VirtualUsers   int
-	DevicesPerUser int
-	RampUp         time.Duration
-	BatchSize      int
-	BatchInterval  time.Duration
-	Duration       time.Duration
-	Config         Config
+	Metrics                  MetricSelection
+	AccountIndex             int
+	VirtualUsers             int
+	DevicesPerUser           int
+	RampUp                   time.Duration
+	BatchSize                int
+	BatchInterval            time.Duration
+	HeartRateInterval        time.Duration
+	StepsAggregationInterval time.Duration
+	Duration                 time.Duration
+	Config                   Config
 }
 
 func ParseRunPlan(args []string, getenv func(string) string) (RunPlan, string, error) {
@@ -60,8 +63,8 @@ func ParseRunPlan(args []string, getenv func(string) string) (RunPlan, string, e
 	fs.SetOutput(os.Stderr)
 	fs.Usage = func() {
 		fmt.Fprintln(fs.Output(), "Usage: producer [step|heart-rate] [options]")
-		fmt.Fprintln(fs.Output(), "Without a selector, both authenticated metric streams run. Measurements are sampled once per second.")
-		fmt.Fprintln(fs.Output(), "Use --batch-interval (or its --interval alias) to set the shared flush cadence.")
+		fmt.Fprintln(fs.Output(), "Without a selector, both authenticated metric streams run.")
+		fmt.Fprintln(fs.Output(), "Heart Rate sampling, Steps aggregation and request sync use independent schedules.")
 		fmt.Fprintln(fs.Output(), "Options:")
 		fs.PrintDefaults()
 	}
@@ -86,8 +89,11 @@ func ParseRunPlan(args []string, getenv func(string) string) (RunPlan, string, e
 	devices := fs.Int("devices-per-user", devicesDefault, "simulated devices per account (only 1 is supported)")
 	rampText := fs.String("ramp-up", envString(getenv("VITALOOM_RAMP_UP"), "0s"), "time over which virtual users start")
 	batchSize := fs.Int("batch-size", batchDefault, "maximum events per request (1-500)")
-	batchIntervalFlag := fs.String("batch-interval", "", "shared flush cadence (default 5s; takes precedence over --interval)")
-	intervalAliasFlag := fs.String("interval", "", "compatibility alias for --batch-interval")
+	hrIntervalText := fs.String("heart-rate-interval", envString(getenv("VITALOOM_HEART_RATE_INTERVAL"), defaultHeartRateInterval.String()), "Heart Rate sampling cadence")
+	stepsAggregationText := fs.String("steps-aggregation-interval", envString(getenv("VITALOOM_STEPS_AGGREGATION_INTERVAL"), defaultStepsAggregationInterval.String()), "Steps aggregation window (whole seconds, 1s-1h)")
+	syncIntervalFlag := fs.String("sync-interval", "", "request sync cadence (default 60s; --batch-interval and --interval are aliases)")
+	batchIntervalFlag := fs.String("batch-interval", "", "compatibility alias for --sync-interval (takes precedence over --interval)")
+	intervalAliasFlag := fs.String("interval", "", "compatibility alias for --sync-interval")
 	durationText := fs.String("duration", envString(getenv("VITALOOM_DURATION"), "0s"), "run duration; 0s continues until stopped")
 	apiBaseURL := fs.String("api-base-url", strings.TrimSpace(getenv("VITALOOM_API_BASE_URL")), "authorized test Nginx base URL")
 	timeoutText := fs.String("timeout", envString(getenv("VITALOOM_TIMEOUT"), "5s"), "timeout per HTTP attempt")
@@ -131,9 +137,17 @@ func ParseRunPlan(args []string, getenv func(string) string) (RunPlan, string, e
 	if batchSizeValue < 1 || batchSizeValue > maxBatchSize {
 		return RunPlan{}, "", fmt.Errorf("--batch-size must be between 1 and %d", maxBatchSize)
 	}
-	batchIntervalValue, err := resolveBatchInterval(visited, *batchIntervalFlag, *intervalAliasFlag, getenv)
+	batchIntervalValue, err := resolveBatchInterval(visited, *syncIntervalFlag, *batchIntervalFlag, *intervalAliasFlag, getenv)
 	if err != nil {
 		return RunPlan{}, "", err
+	}
+	hrInterval, err := time.ParseDuration(strings.TrimSpace(*hrIntervalText))
+	if err != nil || hrInterval <= 0 {
+		return RunPlan{}, "", errors.New("--heart-rate-interval must be a positive duration")
+	}
+	stepsAggregation, err := time.ParseDuration(strings.TrimSpace(*stepsAggregationText))
+	if err != nil || stepsAggregation < time.Second || stepsAggregation > time.Hour || stepsAggregation%time.Second != 0 {
+		return RunPlan{}, "", errors.New("--steps-aggregation-interval must be a whole-second duration from 1s through 1h")
 	}
 	duration, err := time.ParseDuration(strings.TrimSpace(*durationText))
 	if err != nil || duration < 0 {
@@ -167,8 +181,8 @@ func ParseRunPlan(args []string, getenv func(string) string) (RunPlan, string, e
 	}
 	plan := RunPlan{
 		Metrics: metrics, AccountIndex: accountIndex, VirtualUsers: virtualUsers, DevicesPerUser: *devices,
-		RampUp: rampUp, BatchSize: batchSizeValue, BatchInterval: batchIntervalValue, Duration: duration,
-		Config: Config{APIBaseURL: strings.TrimRight(strings.TrimSpace(*apiBaseURL), "/"), BatchSize: batchSizeValue, Interval: batchIntervalValue, Duration: duration, Timeout: timeout, MaxRetries: *retries, RetryDelay: retryDelay},
+		RampUp: rampUp, BatchSize: batchSizeValue, BatchInterval: batchIntervalValue, HeartRateInterval: hrInterval, StepsAggregationInterval: stepsAggregation, Duration: duration,
+		Config: Config{APIBaseURL: strings.TrimRight(strings.TrimSpace(*apiBaseURL), "/"), BatchSize: batchSizeValue, Interval: batchIntervalValue, HeartRateInterval: hrInterval, StepsAggregationInterval: stepsAggregation, Duration: duration, Timeout: timeout, MaxRetries: *retries, RetryDelay: retryDelay},
 	}
 	if plan.VirtualUsers == 0 {
 		plan.VirtualUsers = 1
@@ -195,23 +209,27 @@ func envString(value, fallback string) string {
 	return strings.TrimSpace(value)
 }
 
-func resolveBatchInterval(visited map[string]bool, canonicalFlag, aliasFlag string, getenv func(string) string) (time.Duration, error) {
+func resolveBatchInterval(visited map[string]bool, syncFlag, canonicalFlag, aliasFlag string, getenv func(string) string) (time.Duration, error) {
 	value := ""
 	switch {
+	case visited["sync-interval"]:
+		value = syncFlag
 	case visited["batch-interval"]:
 		value = canonicalFlag
 	case visited["interval"]:
 		value = aliasFlag
+	case strings.TrimSpace(getenv("VITALOOM_SYNC_INTERVAL")) != "":
+		value = getenv("VITALOOM_SYNC_INTERVAL")
 	case strings.TrimSpace(getenv("VITALOOM_BATCH_INTERVAL")) != "":
 		value = getenv("VITALOOM_BATCH_INTERVAL")
 	case strings.TrimSpace(getenv("VITALOOM_INTERVAL")) != "":
 		value = getenv("VITALOOM_INTERVAL")
 	default:
-		value = "5s"
+		value = defaultSyncInterval.String()
 	}
 	interval, err := time.ParseDuration(strings.TrimSpace(value))
 	if err != nil || interval <= 0 {
-		return 0, errors.New("--batch-interval must be a positive duration")
+		return 0, errors.New("--sync-interval must be a positive duration")
 	}
 	return interval, nil
 }
@@ -252,20 +270,19 @@ func runPlan(ctx context.Context, plan RunPlan, password string, logger *log.Log
 		account := deterministicAccount(index)
 		session := sessions[account.Email]
 		launchDelay := spreadDuration(plan.RampUp, index-from, count)
-		flushPhase := spreadDuration(plan.BatchInterval, index-from, count)
+		flushPhase := syncPhase(plan.BatchInterval, index-from, count, runID)
 		go func() {
 			vuLogger := log.New(&identityWriter{logger: logger, prefix: fmt.Sprintf("account=%s ", account.Email)}, "", 0)
 			results <- runVirtualUser(workerCtx, plan, runID, account, session, auth, heartClient, stepsClient, launchDelay, plan.BatchInterval+flushPhase, vuLogger)
 		}()
 	}
-	var firstErr error
+	workerErrors := make([]error, 0)
 	for i := 0; i < count; i++ {
-		if workerErr := <-results; workerErr != nil && firstErr == nil {
-			firstErr = workerErr
-			stopWorkers()
+		if workerErr := <-results; workerErr != nil {
+			workerErrors = append(workerErrors, workerErr)
 		}
 	}
-	return firstErr
+	return errors.Join(workerErrors...)
 }
 
 type sessionToken struct {
@@ -296,10 +313,27 @@ type metricSendResult struct {
 }
 
 func runVirtualUser(ctx context.Context, plan RunPlan, runID string, account Account, session *Session, auth *AuthClient, heartClient *authenticatedHeartRateClient, stepsClient *stepsClient, launchDelay, firstFlushDelay time.Duration, logger *log.Logger) error {
+	vuRunID := fmt.Sprintf("%s-vu-%04d", runID, account.Index)
 	if err := waitContext(ctx, launchDelay); err != nil {
+		cause := "external_cancellation"
+		if errors.Is(err, context.DeadlineExceeded) {
+			cause = "duration_elapsed"
+		}
+		logger.Printf("producer_worker_not_started run_id=%s account_index=%d cause=%s", vuRunID, account.Index, cause)
 		return nil
 	}
-	vuRunID := fmt.Sprintf("%s-vu-%04d", runID, account.Index)
+	startedAt := time.Now().UTC()
+	cause := "completed"
+	var stoppedAt time.Time
+	drainTimedOut := false
+	logger.Printf("producer_worker_started run_id=%s account_index=%d started_at=%s", vuRunID, account.Index, startedAt.Format(time.RFC3339Nano))
+	defer func() {
+		completedAt := time.Now().UTC()
+		if stoppedAt.IsZero() {
+			stoppedAt = completedAt
+		}
+		logger.Printf("producer_worker_stopped run_id=%s account_index=%d started_at=%s stopped_at=%s completed_at=%s cause=%s drain_timed_out=%t", vuRunID, account.Index, startedAt.Format(time.RFC3339Nano), stoppedAt.Format(time.RFC3339Nano), completedAt.Format(time.RFC3339Nano), cause, drainTimedOut)
+	}()
 	token := &sessionToken{auth: auth, session: session}
 	var heartGenerator *EventGenerator
 	var stepsGenerator *StepEventGenerator
@@ -312,8 +346,18 @@ func runVirtualUser(ctx context.Context, plan RunPlan, runID string, account Acc
 	}
 	deviceID := fmt.Sprintf("device-loadtest-%04d", account.Index)
 	stepsID := stepsDeviceID(account.Index)
-	measurementTicker := time.NewTicker(observationInterval)
-	defer measurementTicker.Stop()
+	var heartTicker, stepsTicker *time.Ticker
+	var heartTicks, stepsTicks <-chan time.Time
+	if heartGenerator != nil {
+		heartTicker = time.NewTicker(plan.HeartRateInterval)
+		heartTicks = heartTicker.C
+		defer heartTicker.Stop()
+	}
+	if stepsGenerator != nil {
+		stepsTicker = time.NewTicker(observationInterval)
+		stepsTicks = stepsTicker.C
+		defer stepsTicker.Stop()
+	}
 	firstFlush := time.NewTimer(firstFlushDelay)
 	defer firstFlush.Stop()
 	var flushTicker *time.Ticker
@@ -323,6 +367,8 @@ func runVirtualUser(ctx context.Context, plan RunPlan, runID string, account Acc
 	completion := make(chan metricSendResult, 2)
 	hrQueue := make([]HeartRateEvent, 0, plan.BatchSize)
 	stepsQueue := make([]StepEvent, 0, plan.BatchSize)
+	var stepWindowStart, stepWindowEnd time.Time
+	stepWindowDelta := 0
 	var activeHR *authenticatedHeartRateBatch
 	var activeSteps *authenticatedStepsBatch
 	flushHR, flushSteps := false, false
@@ -336,16 +382,34 @@ func runVirtualUser(ctx context.Context, plan RunPlan, runID string, account Acc
 	var hrAccepted, hrDuplicates, hrRejected, stepsAccepted, stepsDuplicates, stepsRejected int
 	startDrain := func(err error) {
 		if !draining {
+			if stepWindowDelta > 0 && len(stepsQueue)+batchCountSteps(activeSteps) < queueLimit {
+				appendStepsWindow(stepsGenerator, &stepsQueue, &stepWindowStart, &stepWindowEnd, &stepWindowDelta)
+			} else if stepWindowDelta == 0 {
+				stepWindowStart, stepWindowEnd = time.Time{}, time.Time{}
+			}
 			draining = true
+			stoppedAt = time.Now().UTC()
 			drainTimer = time.NewTimer(shutdownBudget)
 			drainTimeout = drainTimer.C
-			measurementTicker.Stop()
+			if heartTicker != nil {
+				heartTicker.Stop()
+			}
+			if stepsTicker != nil {
+				stepsTicker.Stop()
+			}
 			if flushTicker != nil {
 				flushTicker.Stop()
 			}
 			firstFlush.Stop()
 			ctxDone = nil
 			flushTicks = nil
+		}
+		if err == nil && cause == "completed" && ctx.Err() != nil {
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				cause = "duration_elapsed"
+			} else {
+				cause = "external_cancellation"
+			}
 		}
 		if err != nil && stopErr == nil {
 			stopErr = err
@@ -356,12 +420,12 @@ func runVirtualUser(ctx context.Context, plan RunPlan, runID string, account Acc
 			drainTimer.Stop()
 		}
 		status := "completed"
-		if err != nil || len(hrQueue) > 0 || len(stepsQueue) > 0 || hrUnknown > 0 || stepsUnknown > 0 || activeHR != nil || activeSteps != nil {
+		if err != nil || len(hrQueue) > 0 || len(stepsQueue) > 0 || hrUnknown > 0 || stepsUnknown > 0 || activeHR != nil || activeSteps != nil || stepWindowDelta > 0 {
 			status = "failed"
 		}
-		logger.Printf("producer_summary status=%s run_id=%s metrics=%s heart_rate_accepted=%d heart_rate_duplicates=%d heart_rate_rejected=%d steps_accepted=%d steps_duplicates=%d steps_rejected=%d heart_rate_queued_unsent=%d steps_queued_unsent=%d heart_rate_inflight_unconfirmed=%d steps_inflight_unconfirmed=%d", status, vuRunID, metricNames(plan.Metrics), hrAccepted, hrDuplicates, hrRejected, stepsAccepted, stepsDuplicates, stepsRejected, len(hrQueue), len(stepsQueue), hrUnknown+batchCountHR(activeHR), stepsUnknown+batchCountSteps(activeSteps))
-		if len(hrQueue)+len(stepsQueue)+hrUnknown+stepsUnknown+batchCountHR(activeHR)+batchCountSteps(activeSteps) > 0 {
-			outcomeErr := fmt.Errorf("account %d shutdown left queued_unsent=%d inflight_unconfirmed=%d", account.Index, len(hrQueue)+len(stepsQueue), hrUnknown+stepsUnknown+batchCountHR(activeHR)+batchCountSteps(activeSteps))
+		logger.Printf("producer_summary status=%s run_id=%s metrics=%s heart_rate_accepted=%d heart_rate_duplicates=%d heart_rate_rejected=%d steps_accepted=%d steps_duplicates=%d steps_rejected=%d heart_rate_queued_unsent=%d steps_queued_unsent=%d steps_open_window_unsent=%d heart_rate_inflight_unconfirmed=%d steps_inflight_unconfirmed=%d", status, vuRunID, metricNames(plan.Metrics), hrAccepted, hrDuplicates, hrRejected, stepsAccepted, stepsDuplicates, stepsRejected, len(hrQueue), len(stepsQueue), stepWindowDelta, hrUnknown+batchCountHR(activeHR), stepsUnknown+batchCountSteps(activeSteps))
+		if len(hrQueue)+len(stepsQueue)+hrUnknown+stepsUnknown+batchCountHR(activeHR)+batchCountSteps(activeSteps)+boolInt(stepWindowDelta > 0) > 0 {
+			outcomeErr := fmt.Errorf("account %d shutdown left queued_unsent=%d open_steps_window=%d inflight_unconfirmed=%d", account.Index, len(hrQueue)+len(stepsQueue), boolInt(stepWindowDelta > 0), hrUnknown+stepsUnknown+batchCountHR(activeHR)+batchCountSteps(activeSteps))
 			if err != nil {
 				return errors.Join(err, outcomeErr)
 			}
@@ -418,6 +482,7 @@ func runVirtualUser(ctx context.Context, plan RunPlan, runID string, account Acc
 		select {
 		case <-drainTimeout:
 			cancelSend()
+			drainTimedOut = true
 			return finish(errors.New("producer shutdown exceeded the 5s drain budget"))
 		default:
 		}
@@ -428,6 +493,11 @@ func runVirtualUser(ctx context.Context, plan RunPlan, runID string, account Acc
 		}
 		select {
 		case <-ctxDone:
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				cause = "duration_elapsed"
+			} else {
+				cause = "external_cancellation"
+			}
 			startDrain(nil)
 		case <-flushTicks:
 			if !draining {
@@ -438,27 +508,41 @@ func runVirtualUser(ctx context.Context, plan RunPlan, runID string, account Acc
 					flushTicks = flushTicker.C
 				}
 			}
-		case tick := <-measurementTicker.C:
+		case tick := <-heartTicks:
 			if draining {
 				continue
 			}
 			occurredAt := tick.UTC().Truncate(time.Millisecond)
 			if heartGenerator != nil {
 				if len(hrQueue)+batchCountHR(activeHR) >= queueLimit {
+					cause = "queue_limit"
 					startDrain(errors.New("Heart Rate event queue reached the 1000-event limit"))
 					continue
 				}
 				phase := heartGenerator.activityPhase(occurredAt)
 				hrQueue = append(hrQueue, heartGenerator.nextHeartRateEvent(occurredAt, phase))
 			}
-			if stepsGenerator != nil {
+		case tick := <-stepsTicks:
+			if draining || stepsGenerator == nil {
+				continue
+			}
+			endAt := tick.UTC().Truncate(time.Second)
+			startAt := endAt.Add(-time.Second)
+			if !stepWindowEnd.IsZero() && !stepWindowEnd.Equal(startAt) {
+				appendStepsWindow(stepsGenerator, &stepsQueue, &stepWindowStart, &stepWindowEnd, &stepWindowDelta)
+			}
+			if stepWindowStart.IsZero() {
+				stepWindowStart = startAt
+			}
+			stepWindowEnd = endAt
+			stepWindowDelta += stepsGenerator.NextDelta()
+			if shouldCloseStepsWindow(stepWindowStart, stepWindowEnd, plan.StepsAggregationInterval) {
 				if len(stepsQueue)+batchCountSteps(activeSteps) >= queueLimit {
+					cause = "queue_limit"
 					startDrain(errors.New("Steps event queue reached the 1000-event limit"))
 					continue
 				}
-				if event, ok := stepsGenerator.Next(occurredAt); ok {
-					stepsQueue = append(stepsQueue, event)
-				}
+				appendStepsWindow(stepsGenerator, &stepsQueue, &stepWindowStart, &stepWindowEnd, &stepWindowDelta)
 			}
 		case result := <-completion:
 			if result.metric == MetricHeartRate {
@@ -466,8 +550,9 @@ func runVirtualUser(ctx context.Context, plan RunPlan, runID string, account Acc
 					hrUnknown += len(result.hrBatch.Events)
 					activeHR = nil
 					failedHR = true
+					cause = "bounded_retries_exhausted"
 					startDrain(fmt.Errorf("Heart Rate batch failed after bounded retries: %w", result.err))
-					logger.Printf("heart_rate_batch_failed run_id=%s submitted=%d http_status=%d error=%q inflight_unconfirmed=%d", vuRunID, len(result.hrBatch.Events), result.status, result.err.Error(), len(result.hrBatch.Events))
+					logger.Printf("heart_rate_batch_failed run_id=%s submitted=%d http_status=%d cause=bounded_retries_exhausted inflight_unconfirmed=%d", vuRunID, len(result.hrBatch.Events), result.status, len(result.hrBatch.Events))
 					continue
 				}
 				hrAccepted += result.hrResult.Accepted
@@ -489,8 +574,9 @@ func runVirtualUser(ctx context.Context, plan RunPlan, runID string, account Acc
 					stepsUnknown += len(result.stBatch.Events)
 					activeSteps = nil
 					failedSteps = true
+					cause = "bounded_retries_exhausted"
 					startDrain(fmt.Errorf("Steps batch failed after bounded retries: %w", result.err))
-					logger.Printf("steps_batch_failed run_id=%s submitted=%d http_status=%d error=%q inflight_unconfirmed=%d", vuRunID, len(result.stBatch.Events), result.status, result.err.Error(), len(result.stBatch.Events))
+					logger.Printf("steps_batch_failed run_id=%s submitted=%d http_status=%d cause=bounded_retries_exhausted inflight_unconfirmed=%d", vuRunID, len(result.stBatch.Events), result.status, len(result.stBatch.Events))
 					continue
 				}
 				stepsAccepted += result.stResult.Accepted
@@ -527,6 +613,51 @@ func spreadDuration(total time.Duration, index, count int) time.Duration {
 		return 0
 	}
 	return total/time.Duration(count)*time.Duration(index) + (total%time.Duration(count))*time.Duration(index)/time.Duration(count)
+}
+
+func syncPhase(total time.Duration, index, count int, runID string) time.Duration {
+	if count <= 0 || index < 0 || index >= count || total <= 0 {
+		return 0
+	}
+	slotStart := spreadDuration(total, index, count)
+	slotEnd := spreadDuration(total, index+1, count)
+	slotWidth := slotEnd - slotStart
+	if slotWidth < 4 {
+		return slotStart
+	}
+	hash := fnv.New64a()
+	_, _ = hash.Write([]byte(runID + ":" + strconv.Itoa(index)))
+	quarter := slotWidth / 4
+	jitterWidth := slotWidth / 2
+	jitter := time.Duration(hash.Sum64() % uint64(jitterWidth+1))
+	return slotStart + quarter + jitter
+}
+
+func appendStepsWindow(generator *StepEventGenerator, queue *[]StepEvent, startAt, endAt *time.Time, delta *int) {
+	if generator == nil || queue == nil || startAt == nil || endAt == nil || delta == nil {
+		return
+	}
+	if *delta > 0 {
+		if event, ok := generator.NextInterval(*startAt, *endAt, *delta); ok {
+			*queue = append(*queue, event)
+		}
+	}
+	*startAt, *endAt, *delta = time.Time{}, time.Time{}, 0
+}
+
+func shouldCloseStepsWindow(startAt, endAt time.Time, aggregationInterval time.Duration) bool {
+	if startAt.IsZero() || endAt.IsZero() || endAt.Before(startAt) {
+		return false
+	}
+	_, minute, second := endAt.In(hoChiMinhLocation).Clock()
+	return endAt.Sub(startAt) >= aggregationInterval || minute == 0 && second == 0
+}
+
+func boolInt(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
 }
 
 func waitContext(ctx context.Context, delay time.Duration) error {

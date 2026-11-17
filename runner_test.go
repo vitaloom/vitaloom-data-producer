@@ -24,6 +24,10 @@ type runCapture struct {
 	summaryHits  int
 }
 
+type runLogWriter func([]byte) (int, error)
+
+func (w runLogWriter) Write(p []byte) (int, error) { return w(p) }
+
 func newRunServer(t *testing.T, capture *runCapture, delay time.Duration) *httptest.Server {
 	t.Helper()
 	if capture.loginCounts == nil {
@@ -114,7 +118,7 @@ func TestUnifiedRunnerMetricSelectorsReuseSingleSessionAndRetireSummary(t *testi
 			if tt.selector != "" {
 				args = append(args, tt.selector)
 			}
-			args = append(args, "--batch-interval", "1s", "--duration", "1300ms")
+			args = append(args, "--heart-rate-interval", "1s", "--steps-aggregation-interval", "1s", "--batch-interval", "1s", "--duration", "1300ms")
 			plan, password, err := ParseRunPlan(args, testRunEnv(server.URL))
 			if err != nil {
 				t.Fatal(err)
@@ -141,7 +145,7 @@ func TestUnifiedRunnerUsesFixedOneSecondObservationsAndCommonVUs(t *testing.T) {
 	capture := &runCapture{}
 	server := newRunServer(t, capture, 0)
 	defer server.Close()
-	plan, password, err := ParseRunPlan([]string{"--virtual-users", "2", "--ramp-up", "0s", "--batch-size", "1", "--batch-interval", "1s", "--duration", "1300ms"}, testRunEnv(server.URL))
+	plan, password, err := ParseRunPlan([]string{"--virtual-users", "2", "--ramp-up", "0s", "--batch-size", "1", "--heart-rate-interval", "1s", "--steps-aggregation-interval", "1s", "--batch-interval", "1s", "--duration", "1300ms"}, testRunEnv(server.URL))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -165,6 +169,152 @@ func TestUnifiedRunnerUsesFixedOneSecondObservationsAndCommonVUs(t *testing.T) {
 		if len(batch.Events) > 1 {
 			t.Errorf("Steps batch exceeded cap 1: %d", len(batch.Events))
 		}
+	}
+}
+
+func TestFailedWorkerDoesNotCancelSibling(t *testing.T) {
+	var siblingHeartBatches atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/auth/login":
+			var request authRequest
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Errorf("decode login: %v", err)
+			}
+			_ = json.NewEncoder(w).Encode(authResponse{AccessToken: "access-" + request.Email, RefreshToken: "refresh-" + request.Email, ExpiresInSeconds: 900})
+		case "/api/heart-rate/batch":
+			var batch authenticatedHeartRateBatch
+			if err := json.NewDecoder(r.Body).Decode(&batch); err != nil {
+				t.Errorf("decode Heart Rate batch: %v", err)
+			}
+			if r.Header.Get("Authorization") == "Bearer access-loadtest-0001@vitaloom.test" {
+				http.Error(w, "temporarily unavailable", http.StatusServiceUnavailable)
+				return
+			}
+			siblingHeartBatches.Add(1)
+			writeHeartRateResponse(w, batch, repeatStatus("ACCEPTED", len(batch.Events)), len(batch.Events), 0, 0)
+		case "/api/steps/batch":
+			var batch authenticatedStepsBatch
+			if err := json.NewDecoder(r.Body).Decode(&batch); err != nil {
+				t.Errorf("decode Steps batch: %v", err)
+			}
+			writeStepsResponse(w, batch, repeatStatus("ACCEPTED", len(batch.Events)), len(batch.Events), 0, 0)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	plan, password, err := ParseRunPlan([]string{"--virtual-users", "2", "--batch-size", "1", "--heart-rate-interval", "1s", "--steps-aggregation-interval", "1s", "--batch-interval", "1s", "--duration", "2400ms", "--timeout", "100ms", "--max-retries", "0"}, testRunEnv(server.URL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var output strings.Builder
+	logger := log.New(&output, "", 0)
+	started := time.Now()
+	err = runPlan(context.Background(), plan, password, logger)
+	if err == nil || !strings.Contains(err.Error(), "Heart Rate batch failed after bounded retries") {
+		t.Fatalf("runPlan() error = %v; want exhausted worker error", err)
+	}
+	if elapsed := time.Since(started); elapsed < 2200*time.Millisecond {
+		t.Fatalf("runPlan() ended after %s; sibling should run through planned duration", elapsed)
+	}
+	if got := siblingHeartBatches.Load(); got < 2 {
+		t.Fatalf("sibling Heart Rate batches=%d; want ongoing sends through planned duration", got)
+	}
+	logs := output.String()
+	if !strings.Contains(logs, "producer_worker_stopped run_id=") || !strings.Contains(logs, "cause=bounded_retries_exhausted") || !strings.Contains(logs, "cause=duration_elapsed") {
+		t.Fatalf("worker lifecycle logs missing structured stop causes:\n%s", logs)
+	}
+	for _, line := range strings.Split(logs, "\n") {
+		if !strings.Contains(line, "producer_worker_started") && !strings.Contains(line, "producer_worker_stopped") {
+			continue
+		}
+		fields := strings.Fields(line)
+		values := make(map[string]string)
+		for _, field := range fields[1:] {
+			parts := strings.SplitN(field, "=", 2)
+			if len(parts) == 2 {
+				values[parts[0]] = parts[1]
+			}
+		}
+		keys := []string{"started_at"}
+		if strings.Contains(line, "producer_worker_stopped") {
+			keys = append(keys, "stopped_at", "completed_at")
+		}
+		for _, key := range keys {
+			if _, parseErr := time.Parse(time.RFC3339Nano, values[key]); parseErr != nil {
+				t.Errorf("invalid %s timestamp in lifecycle log: %q", key, values[key])
+			}
+		}
+	}
+}
+
+func TestWorkerCanceledDuringRampIsLoggedAsNotStarted(t *testing.T) {
+	var logins atomic.Int32
+	loginsReady := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/auth/login" {
+			http.NotFound(w, r)
+			return
+		}
+		var request authRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode login: %v", err)
+		}
+		if logins.Add(1) == 2 {
+			close(loginsReady)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(authResponse{AccessToken: "access-" + request.Email, RefreshToken: "refresh-" + request.Email, ExpiresInSeconds: 900})
+	}))
+	defer server.Close()
+	plan, password, err := ParseRunPlan([]string{"--virtual-users", "2", "--ramp-up", "5s", "--batch-interval", "1s"}, testRunEnv(server.URL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var output strings.Builder
+	workerStarted := make(chan struct{}, 1)
+	writer := runLogWriter(func(p []byte) (int, error) {
+		_, _ = output.Write(p)
+		if strings.Contains(string(p), "producer_worker_started") && strings.Contains(string(p), "account_index=1") {
+			select {
+			case workerStarted <- struct{}{}:
+			default:
+			}
+		}
+		return len(p), nil
+	})
+	result := make(chan error, 1)
+	go func() { result <- runPlan(ctx, plan, password, log.New(writer, "", 0)) }()
+	select {
+	case <-loginsReady:
+	case <-time.After(2 * time.Second):
+		t.Fatal("workers did not warm both sessions")
+	}
+	select {
+	case <-workerStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first worker did not start after session warmup")
+	}
+	cancel()
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("runPlan() error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("runPlan() did not stop after external cancellation")
+	}
+	logs := output.String()
+	if !strings.Contains(logs, "producer_worker_not_started run_id=") || !strings.Contains(logs, "account_index=2 cause=external_cancellation") {
+		t.Fatalf("ramp-canceled worker was not reported as not started:\n%s", logs)
+	}
+	if strings.Contains(logs, "producer_worker_started run_id=") && strings.Contains(logs, "account_index=2 started_at=") {
+		t.Fatalf("ramp-canceled worker was also reported as started:\n%s", logs)
 	}
 }
 
@@ -203,7 +353,7 @@ func TestUnifiedRunnerDrainsQueuesOnShutdown(t *testing.T) {
 	capture := &runCapture{}
 	server := newRunServer(t, capture, 0)
 	defer server.Close()
-	plan, password, err := ParseRunPlan([]string{"--batch-interval", "1m"}, testRunEnv(server.URL))
+	plan, password, err := ParseRunPlan([]string{"--heart-rate-interval", "1s", "--steps-aggregation-interval", "1s", "--batch-interval", "1m"}, testRunEnv(server.URL))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -227,6 +377,32 @@ func TestUnifiedRunnerDrainsQueuesOnShutdown(t *testing.T) {
 	}
 }
 
+func TestShortRunDrainsObservedStepsPrefixWithoutFutureTimestamps(t *testing.T) {
+	capture := &runCapture{}
+	server := newRunServer(t, capture, 0)
+	defer server.Close()
+	plan, password, err := ParseRunPlan([]string{"step", "--steps-aggregation-interval", "60s", "--sync-interval", "1m", "--duration", "1250ms"}, testRunEnv(server.URL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runPlan(context.Background(), plan, password, log.New(io.Discard, "", 0)); err != nil {
+		t.Fatal(err)
+	}
+	capture.mu.Lock()
+	defer capture.mu.Unlock()
+	if len(capture.stepsBatches) != 1 || len(capture.stepsBatches[0].Events) != 1 {
+		t.Fatalf("short run did not flush one observed Steps prefix: %+v", capture.stepsBatches)
+	}
+	event := capture.stepsBatches[0].Events[0]
+	if event.OccurredAt != nil || event.StartAt == nil || event.EndAt == nil || event.EndAt.After(time.Now().UTC()) {
+		t.Fatalf("invalid/future Steps interval: %+v", event)
+	}
+	duration := event.EndAt.Sub(*event.StartAt)
+	if duration < time.Second || duration > 2*time.Second || event.StepsDelta < 1 || event.StepsDelta > 5*int(duration/time.Second) {
+		t.Fatalf("invalid short-run aggregate: duration=%s event=%+v", duration, event)
+	}
+}
+
 func TestBatchChunkHelpersPreserveOrderAndCap(t *testing.T) {
 	hrQueue := make([]HeartRateEvent, 7)
 	stepsQueue := make([]StepEvent, 7)
@@ -245,7 +421,7 @@ func TestHeartRateObservationsStayOneSecondApart(t *testing.T) {
 	capture := &runCapture{}
 	server := newRunServer(t, capture, 0)
 	defer server.Close()
-	plan, password, err := ParseRunPlan([]string{"heart-rate", "--batch-interval", "2s", "--duration", "2300ms"}, testRunEnv(server.URL))
+	plan, password, err := ParseRunPlan([]string{"heart-rate", "--heart-rate-interval", "1s", "--batch-interval", "2s", "--duration", "2300ms"}, testRunEnv(server.URL))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -265,6 +441,33 @@ func TestHeartRateObservationsStayOneSecondApart(t *testing.T) {
 		gap := events[i].OccurredAt.Sub(events[i-1].OccurredAt)
 		if gap < 999*time.Millisecond || gap > 1001*time.Millisecond {
 			t.Fatalf("measurement gap %s; want approximately 1s", gap)
+		}
+	}
+}
+
+func TestSyncStaggerSpreadsVirtualUsersAcrossBoundedPhaseSlots(t *testing.T) {
+	const users = 1000
+	total := time.Minute
+	const runID = "run-phase-test"
+	first := syncPhase(total, 0, users, runID)
+	last := syncPhase(total, users-1, users, runID)
+	if first <= 0 || last <= first || last >= total {
+		t.Fatalf("sync phases out of bounds: first=%s last=%s total=%s", first, last, total)
+	}
+	repeated := syncPhase(total, 0, users, runID)
+	if repeated != first {
+		t.Fatalf("same run and VU produced unstable sync phase: first=%s repeated=%s", first, repeated)
+	}
+	for index := 1; index < users; index++ {
+		slotStart := spreadDuration(total, index, users)
+		slotEnd := spreadDuration(total, index+1, users)
+		phase := syncPhase(total, index, users, runID)
+		if phase < slotStart+(slotEnd-slotStart)/4 || phase > slotStart+3*(slotEnd-slotStart)/4 {
+			t.Fatalf("VU %d phase %s falls outside bounded jitter range for slot [%s,%s)", index+1, phase, slotStart, slotEnd)
+		}
+		previous := syncPhase(total, index-1, users, runID)
+		if phase <= previous {
+			t.Fatalf("sync phases are not staggered at VU %d: previous=%s phase=%s", index+1, previous, phase)
 		}
 	}
 }

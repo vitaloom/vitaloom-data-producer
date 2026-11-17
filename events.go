@@ -15,9 +15,11 @@ type HeartRateEvent struct {
 }
 
 type StepEvent struct {
-	EventID    string    `json:"eventId"`
-	OccurredAt time.Time `json:"occurredAt"`
-	StepsDelta int       `json:"stepsDelta"`
+	EventID    string     `json:"eventId"`
+	OccurredAt *time.Time `json:"occurredAt,omitempty"`
+	StartAt    *time.Time `json:"startAt,omitempty"`
+	EndAt      *time.Time `json:"endAt,omitempty"`
+	StepsDelta int        `json:"stepsDelta"`
 }
 
 type EventGenerator struct {
@@ -82,13 +84,28 @@ func (g *EventGenerator) heartRateFor(phase int) int {
 }
 
 func (g *StepEventGenerator) Next(at time.Time) (StepEvent, bool) {
+	delta := g.NextDelta()
+	return makeStepEvent(g.runID, &g.seq, delta, at)
+}
+
+func (g *StepEventGenerator) NextDelta() int {
 	delta := 0
 	if g.seq == 0 {
 		delta = 1 + g.rng.Intn(5)
 	} else {
 		delta = g.rng.Intn(6)
 	}
-	return makeStepEvent(g.runID, &g.seq, delta, at)
+	return delta
+}
+
+func (g *StepEventGenerator) NextInterval(startAt, endAt time.Time, delta int) (StepEvent, bool) {
+	if delta < 1 || delta > 5*int(endAt.Sub(startAt)/time.Second) || !wholeSecondInterval(startAt, endAt) {
+		return StepEvent{}, false
+	}
+	start := startAt.UTC().Truncate(time.Millisecond)
+	end := endAt.UTC().Truncate(time.Millisecond)
+	g.seq++
+	return StepEvent{EventID: fmt.Sprintf("steps-%s-%06d", g.runID, g.seq), StartAt: &start, EndAt: &end, StepsDelta: delta}, true
 }
 
 func makeStepEvent(runID string, sequence *uint64, delta int, at time.Time) (StepEvent, bool) {
@@ -96,5 +113,11 @@ func makeStepEvent(runID string, sequence *uint64, delta int, at time.Time) (Ste
 		return StepEvent{}, false
 	}
 	*sequence++
-	return StepEvent{EventID: fmt.Sprintf("steps-%s-%06d", runID, *sequence), OccurredAt: at.UTC().Truncate(time.Millisecond), StepsDelta: delta}, true
+	occurredAt := at.UTC().Truncate(time.Millisecond)
+	return StepEvent{EventID: fmt.Sprintf("steps-%s-%06d", runID, *sequence), OccurredAt: &occurredAt, StepsDelta: delta}, true
+}
+
+func wholeSecondInterval(startAt, endAt time.Time) bool {
+	duration := endAt.Sub(startAt)
+	return !startAt.IsZero() && !endAt.IsZero() && duration >= time.Second && duration <= time.Hour && duration%time.Second == 0 && startAt.Nanosecond()%int(time.Second) == 0 && endAt.Nanosecond()%int(time.Second) == 0
 }

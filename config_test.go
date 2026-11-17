@@ -23,7 +23,7 @@ func TestParseRunPlanSelectorsAndDefaults(t *testing.T) {
 			if err != nil {
 				t.Fatalf("ParseRunPlan() error = %v", err)
 			}
-			if plan.Metrics != tt.metrics || plan.AccountIndex != 1 || plan.VirtualUsers != 1 || plan.DevicesPerUser != 1 || plan.BatchSize != 5 || plan.BatchInterval != 5*time.Second || plan.Duration != 0 {
+			if plan.Metrics != tt.metrics || plan.AccountIndex != 1 || plan.VirtualUsers != 1 || plan.DevicesPerUser != 1 || plan.BatchSize != 5 || plan.BatchInterval != 60*time.Second || plan.HeartRateInterval != 300*time.Second || plan.StepsAggregationInterval != 60*time.Second || plan.Duration != 0 {
 				t.Fatalf("plan = %+v", plan)
 			}
 			if plan.Config.APIBaseURL != "http://nginx.test" || plan.Config.Timeout != 5*time.Second || plan.Config.MaxRetries != 3 || plan.Config.RetryDelay != 500*time.Millisecond {
@@ -37,8 +37,9 @@ func TestParseRunPlanFlagEnvPrecedenceAndIntervalAliases(t *testing.T) {
 	envMap := map[string]string{
 		"VITALOOM_API_BASE_URL":   "http://nginx.test",
 		"VITALOOM_TEST_PASSWORD":  "test-password-123",
-		"VITALOOM_BATCH_INTERVAL": "4s",
-		"VITALOOM_INTERVAL":       "3s",
+		"VITALOOM_SYNC_INTERVAL":  "4s",
+		"VITALOOM_BATCH_INTERVAL": "3s",
+		"VITALOOM_INTERVAL":       "2s",
 		"VITALOOM_BATCH_SIZE":     "7",
 		"VITALOOM_DURATION":       "9s",
 		"VITALOOM_TIMEOUT":        "2s",
@@ -57,12 +58,33 @@ func TestParseRunPlanFlagEnvPrecedenceAndIntervalAliases(t *testing.T) {
 	}
 	plan, _, err = ParseRunPlan(nil, env)
 	if err != nil || plan.BatchInterval != 4*time.Second {
-		t.Fatalf("canonical interval env should win: interval=%s err=%v", plan.BatchInterval, err)
+		t.Fatalf("sync interval env should win: interval=%s err=%v", plan.BatchInterval, err)
+	}
+	delete(envMap, "VITALOOM_SYNC_INTERVAL")
+	plan, _, err = ParseRunPlan(nil, env)
+	if err != nil || plan.BatchInterval != 3*time.Second {
+		t.Fatalf("batch interval env fallback failed: interval=%s err=%v", plan.BatchInterval, err)
 	}
 	delete(envMap, "VITALOOM_BATCH_INTERVAL")
 	plan, _, err = ParseRunPlan(nil, env)
-	if err != nil || plan.BatchInterval != 3*time.Second {
+	if err != nil || plan.BatchInterval != 2*time.Second {
 		t.Fatalf("legacy interval env fallback failed: interval=%s err=%v", plan.BatchInterval, err)
+	}
+}
+
+func TestParseRunPlanConfiguresIndependentMetricAndSyncIntervals(t *testing.T) {
+	env := testRunEnv("http://nginx.test")
+	plan, _, err := ParseRunPlan([]string{"--heart-rate-interval", "12s", "--steps-aggregation-interval", "30s", "--sync-interval", "8s"}, env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.HeartRateInterval != 12*time.Second || plan.StepsAggregationInterval != 30*time.Second || plan.BatchInterval != 8*time.Second {
+		t.Fatalf("independent timing values not applied: %+v", plan)
+	}
+	for _, value := range []string{"0s", "500ms", "3601s", "1.5s"} {
+		if _, _, err := ParseRunPlan([]string{"--steps-aggregation-interval", value}, env); err == nil {
+			t.Errorf("accepted invalid Steps aggregation interval %q", value)
+		}
 	}
 }
 
